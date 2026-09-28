@@ -14,16 +14,16 @@
     · направление: Minimal / Editorial — тёплая бумага, терракотовый акцент, serif-брендинг (сид web-prototype);
     · used_skill: web-prototype; used_design_system: null — у сида собственный стиль, дизайн-система по правилам роутера не подключается;
     · craft: typography / color / anti-ai-slop / accessibility-baseline / state-coverage / laws-of-ux / form-validation / animation-discipline;
-    · транспорт: публичный релей ntfy.sh (JSON POST + SSE); если среда блокирует внешние соединения (CSP превью) — авто-переключение в локальный режим (BroadcastChannel между окнами).
+    · транспорт: приватная база Supabase (анонимная сессия → серверная проверка кода доступа → защита на уровне строк); публичных каналов нет.
 -->
 <script>
-  // До первой отрисовки: прячем ненужные экраны (если пароль / имя уже введены ранее).
+  // До первой отрисовки: прячем экран входа, если сессия уже есть (вернём из скрипта при необходимости).
   try {
-    var a = localStorage.getItem('potok.v1.auth');
+    var s = localStorage.getItem('sb-bnlyvzmpumfjacnilykh-auth-token');
     var n = localStorage.getItem('potok.v1.name');
     var cl = document.documentElement.classList;
     if (n) cl.add('has-name');
-    if (a === '1') cl.add('has-auth'); else cl.add('no-auth');
+    if (s) cl.add('has-session');
   } catch (e) {}
 </script>
 <style>
@@ -120,7 +120,6 @@
   .conn[data-state="online"] .conn-dot { background: var(--accent); animation: ring 2.4s ease-out infinite; }
   .conn[data-state="connecting"] .conn-dot, .conn[data-state="reconnecting"] .conn-dot { animation: blink 1.2s ease-in-out infinite; }
   .conn[data-state="error"] .conn-dot { background: var(--accent); }
-  .conn[data-state="local"] .conn-dot { background: var(--surface); border: 1.5px solid var(--muted); }
   @keyframes ring {
     0% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--accent) 40%, transparent); }
     100% { box-shadow: 0 0 0 8px transparent; }
@@ -171,17 +170,6 @@
   }
   .btn-mini:hover { border-color: var(--accent); }
 
-  .notice {
-    display: flex; align-items: center; gap: 8px;
-    width: calc(100% - 32px); max-width: var(--chat-w);
-    margin: 12px auto 0; padding: 7px 8px 7px 14px;
-    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
-    font-size: 12.5px; color: var(--muted);
-  }
-  .notice[hidden] { display: none; }
-  .notice span { flex: 1; }
-  .notice .icon-btn { width: 30px; height: 30px; }
-  .notice .icon-btn svg { width: 14px; height: 14px; }
 
   .chat-scroll { flex: 1; overflow-y: auto; overscroll-behavior: contain; scroll-behavior: smooth; }
   .chat-scroll::-webkit-scrollbar { width: 10px; }
@@ -333,8 +321,7 @@
   }
   .overlay[hidden] { display: none; }
   .has-name #nameGate { display: none !important; }
-  .no-auth #nameGate { display: none !important; }
-  .has-auth #passGate { display: none !important; }
+  .has-session #passGate { display: none !important; }
   @keyframes fade-in { from { opacity: 0; } }
   .modal {
     width: min(450px, 100%); max-height: calc(100dvh - 40px); overflow-y: auto;
@@ -528,7 +515,7 @@
         <span class="hint">Enter — отправить · Shift+Enter — новая строка</span>
         <span class="counter" id="charCounter" hidden></span>
       </div>
-      <p class="legal" id="legalLine">Демо-сайт без сервера: сообщения передаются через публичный релей ntfy.sh, история хранится ≈12 часов. Не отправляйте личные данные.</p>
+      <p class="legal" id="legalLine">Закрытый чат: сообщения хранятся в приватной базе и видны только участникам.</p>
     </div>
   </footer>
 </div>
@@ -543,20 +530,20 @@
         <path d="M12 15.6c1.3-1.5 2.7-1.5 4 0s2.7 1.5 4 0" style="stroke:var(--accent);" stroke-width="1.7" fill="none" stroke-linecap="round"/>
       </svg>
     </div>
-    <h1 class="modal-title" id="passTitle">Вход по паролю</h1>
-    <p class="modal-sub">Это закрытый чат. Введите пароль доступа — он запрашивается один раз на устройстве.</p>
+    <h1 class="modal-title" id="passTitle">Вход</h1>
+    <p class="modal-sub">Это закрытый чат: доступ только у своих. Введите код доступа — он спрашивается один раз на устройстве.</p>
     <form id="passForm" novalidate>
       <label class="field">
-        <span class="field-label">Пароль</span>
-        <input class="input" id="passInput" name="password" type="password" maxlength="64" autocomplete="current-password" spellcheck="false" />
+        <span class="field-label">Код доступа</span>
+        <input class="input" id="passInput" name="code" type="password" maxlength="64" autocomplete="current-password" spellcheck="false" />
         <span class="field-error" id="passError" role="alert" hidden></span>
       </label>
-      <button class="btn btn-primary btn-block" type="submit">Войти</button>
+      <button class="btn btn-primary btn-block" type="submit" id="passSubmit">Войти</button>
     </form>
   </div>
 </div>
 
-<div class="overlay" id="nameGate" role="dialog" aria-modal="true" aria-labelledby="gateTitle">
+<div class="overlay" id="nameGate" role="dialog" aria-modal="true" aria-labelledby="gateTitle" hidden>
   <div class="modal">
     <div class="modal-mark" aria-hidden="true">
       <svg viewBox="0 0 32 32" width="46" height="46">
@@ -609,13 +596,15 @@
       </div>
     </form>
     <div class="modal-foot">
-      <span id="aboutHow">Как это работает: сайт статический, без бэкенда. Сообщения уходят в публичную комнату релея ntfy.sh и мгновенно раздаются всем, кто её открыл; история хранится около 12 часов. Не пишите сюда личные данные.</span>
+      <span id="aboutHow">Как это работает: вход по коду доступа; сообщения хранятся в приватной базе и доступны только участникам. История сохраняется постоянно.</span>
     </div>
   </div>
 </div>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
+<script src="config.js"></script>
+<script src="supabase-js.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

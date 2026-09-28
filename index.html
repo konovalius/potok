@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Поток — общий чат</title>
+<meta name="description" content="Живой общий чат: разные люди пишут сообщения, и они появляются сверху вниз у всех сразу. Откройте ссылку на другом устройстве — и вы в одной комнате." />
+<meta name="theme-color" content="rgb(250 250 247)" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='9'%20fill='%23c96442'/%3E%3Crect%20x='8'%20y='10'%20width='16'%20height='11'%20rx='3.5'%20fill='%23fafaf7'/%3E%3Cpath%20d='M11%2021v4.5L16.5%2021z'%20fill='%23fafaf7'/%3E%3Cpath%20d='M12%2015.6c1.3-1.5%202.7-1.5%204%200s2.7%201.5%204%200'%20stroke='%23c96442'%20stroke-width='1.7'%20fill='none'%20stroke-linecap='round'/%3E%3C/svg%3E" />
+<!--
+  «Поток» — общий чат. Демо-сайт AutoClaw, без бэкенда.
+  Discovery (аудит-заметка):
+    · формат: web-prototype (Web-класс) — автономный HTML + app.js;
+    · направление: Minimal / Editorial — тёплая бумага, терракотовый акцент, serif-брендинг (сид web-prototype);
+    · used_skill: web-prototype; used_design_system: null — у сида собственный стиль, дизайн-система по правилам роутера не подключается;
+    · craft: typography / color / anti-ai-slop / accessibility-baseline / state-coverage / laws-of-ux / form-validation / animation-discipline;
+    · транспорт: публичный релей ntfy.sh (JSON POST + SSE); если среда блокирует внешние соединения (CSP превью) — авто-переключение в локальный режим (BroadcastChannel между окнами).
+-->
+<script>
+  // До первой отрисовки: если имя уже сохранено, экран входа не показываем.
+  try { if (localStorage.getItem('potok.v1.name')) document.documentElement.classList.add('has-name'); } catch (e) {}
+</script>
+<style>
+  /* ─── tokens — шестёрка из сида web-prototype ────────────────────── */
+  :root {
+    --bg:      #fafaf7;   /* бумага — фон страницы, никогда #fff */
+    --surface: #ffffff;   /* карточки, модалки, поднятые поверхности */
+    --fg:      #1a1916;   /* основной текст — никогда #000 */
+    --muted:   #6b6964;   /* вторичный текст, подписи */
+    --border:  #e8e5df;   /* волосяные линии, границы */
+    --accent:  #c96442;   /* один акцент — терракота */
+
+    /* производные — не менять «на глаз» */
+    --accent-soft:   color-mix(in oklch, var(--accent) 14%, transparent);
+    --accent-tint:   color-mix(in oklch, var(--accent) 10%, var(--surface));
+    --accent-line:   color-mix(in oklch, var(--accent) 24%, var(--border));
+    --accent-strong: color-mix(in oklch, var(--accent) 86%, black);  /* фон кнопок с белым текстом: контраст ≥4.5 */
+    --accent-ink:    color-mix(in oklch, var(--accent) 82%, black);  /* мелкий акцентный текст: контраст ≥4.5 */
+    --fg-soft:       color-mix(in oklch, var(--fg) 6%, transparent);
+    --shadow-pop:    0 18px 48px -18px color-mix(in oklch, var(--fg) 22%, transparent);
+
+    /* типографика: display = serif, body = sans, mono = цифры и мета */
+    --font-display: 'Iowan Old Style', 'Charter', Georgia, 'Times New Roman', serif;
+    --font-body:    -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    --font-mono:    ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace;
+
+    --radius: 10px;
+    --radius-lg: 16px;
+    --chat-w: 880px;
+  }
+
+  /* ─── reset & base ──────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-body);
+    font-size: 16px;
+    line-height: 1.55;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    height: 100dvh;
+    overflow: hidden;
+  }
+  img, svg { display: block; }
+  button { font: inherit; cursor: pointer; color: inherit; }
+  input, textarea { font: inherit; color: inherit; }
+  a { color: inherit; }
+  p { text-wrap: pretty; }
+  h1, h2, h3 { text-wrap: balance; margin: 0; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+  ::selection { background: var(--accent-soft); }
+
+  .skip-link {
+    position: absolute; left: -9999px; top: 10px; z-index: 100;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 14px; font-size: 14px;
+  }
+  .skip-link:focus { left: 16px; }
+
+  /* ─── каркас приложения ─────────────────────────────────────────── */
+  .app { height: 100dvh; display: grid; grid-template-rows: auto 1fr auto; }
+
+  /* ─── шапка ─────────────────────────────────────────────────────── */
+  .topbar {
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in oklch, var(--bg) 86%, transparent);
+    backdrop-filter: blur(10px);
+  }
+  .topbar-inner {
+    max-width: var(--chat-w); margin-inline: auto;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 10px 20px;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .brand-mark { flex: none; border-radius: 8px; overflow: hidden; }
+  .brand-name { font-family: var(--font-display); font-size: 19px; font-weight: 600; letter-spacing: -0.01em; }
+  .room-chip {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px;
+    background: transparent; max-width: 190px; min-width: 0;
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--muted); white-space: nowrap;
+  }
+  .room-chip:hover { border-color: var(--fg); color: var(--fg); }
+  .room-chip .room-hash { color: var(--accent-ink); }
+  .room-name { overflow: hidden; text-overflow: ellipsis; }
+
+  .topbar-actions { display: flex; align-items: center; gap: 6px; }
+  .conn { display: inline-flex; align-items: center; gap: 7px; margin-right: 4px; font-size: 12.5px; color: var(--muted); }
+  .conn-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .conn[data-state="online"] .conn-dot { background: var(--accent); animation: ring 2.4s ease-out infinite; }
+  .conn[data-state="connecting"] .conn-dot, .conn[data-state="reconnecting"] .conn-dot { animation: blink 1.2s ease-in-out infinite; }
+  .conn[data-state="error"] .conn-dot { background: var(--accent); }
+  .conn[data-state="local"] .conn-dot { background: var(--surface); border: 1.5px solid var(--muted); }
+  @keyframes ring {
+    0% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--accent) 40%, transparent); }
+    100% { box-shadow: 0 0 0 8px transparent; }
+  }
+  @keyframes blink { 50% { opacity: 0.35; } }
+
+  .icon-btn {
+    width: 36px; height: 36px; display: grid; place-items: center;
+    border: 1px solid transparent; border-radius: 10px;
+    background: transparent; color: var(--muted);
+    transition: background 150ms ease, border-color 150ms ease, color 150ms ease;
+  }
+  .icon-btn:hover { color: var(--fg); border-color: var(--border); background: var(--surface); }
+  .icon-btn svg { width: 18px; height: 18px; }
+
+  .me-chip {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 4px 10px 4px 4px; border: 1px solid var(--border); border-radius: 999px;
+    background: var(--surface); transition: border-color 150ms ease;
+  }
+  .me-chip:hover { border-color: var(--fg); }
+  .me-name { font-size: 13.5px; font-weight: 600; letter-spacing: -0.005em; max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .avatar {
+    width: 36px; height: 36px; border-radius: 50%; flex: none;
+    display: grid; place-items: center;
+    font-size: 14px; font-weight: 600; letter-spacing: 0.01em;
+    background: var(--fg-soft); color: var(--fg); user-select: none;
+  }
+  .avatar-sm { width: 26px; height: 26px; font-size: 11.5px; }
+
+  /* ─── лента чата ────────────────────────────────────────────────── */
+  .chat { position: relative; overflow: hidden; display: flex; flex-direction: column; }
+
+  .offline-banner {
+    display: flex; align-items: center; gap: 12px;
+    width: calc(100% - 32px); max-width: var(--chat-w);
+    margin: 12px auto 0; padding: 9px 14px;
+    background: var(--accent-tint); border: 1px solid var(--accent-line); border-radius: 12px;
+    font-size: 13.5px;
+  }
+  .offline-banner[hidden] { display: none; }
+  .offline-banner span { flex: 1; }
+  .btn-mini {
+    padding: 6px 12px; font-size: 13px; border-radius: 8px;
+    border: 1px solid var(--accent-line); background: var(--surface); color: var(--fg);
+    transition: border-color 150ms ease;
+  }
+  .btn-mini:hover { border-color: var(--accent); }
+
+  .notice {
+    display: flex; align-items: center; gap: 8px;
+    width: calc(100% - 32px); max-width: var(--chat-w);
+    margin: 12px auto 0; padding: 7px 8px 7px 14px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    font-size: 12.5px; color: var(--muted);
+  }
+  .notice[hidden] { display: none; }
+  .notice span { flex: 1; }
+  .notice .icon-btn { width: 30px; height: 30px; }
+  .notice .icon-btn svg { width: 14px; height: 14px; }
+
+  .chat-scroll { flex: 1; overflow-y: auto; overscroll-behavior: contain; scroll-behavior: smooth; }
+  .chat-scroll::-webkit-scrollbar { width: 10px; }
+  .chat-scroll::-webkit-scrollbar-thumb { background: color-mix(in oklch, var(--fg) 14%, transparent); border-radius: 99px; border: 3px solid var(--bg); }
+  .chat-scroll::-webkit-scrollbar-track { background: transparent; }
+
+  .chat-inner {
+    max-width: var(--chat-w); margin-inline: auto; min-height: 100%;
+    padding: 18px 20px 26px;
+    display: flex; flex-direction: column;
+  }
+  .messages { display: flex; flex-direction: column; gap: 0; }
+
+  /* день */
+  .day {
+    display: flex; align-items: center; gap: 14px;
+    margin: 22px 0 4px;
+    font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--muted);
+  }
+  .day::before, .day::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
+  .messages > .day:first-child { margin-top: 6px; }
+
+  /* системная заметка */
+  .note {
+    margin: 14px auto 2px; text-align: center;
+    font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.07em;
+    text-transform: uppercase; color: var(--muted);
+  }
+
+  /* сообщение */
+  .msg {
+    display: flex; gap: 10px; align-items: flex-end; justify-content: flex-start;
+    margin-top: 14px;
+    animation: msg-in 180ms cubic-bezier(0.2, 0, 0, 1) both;
+  }
+  .msg.no-anim { animation: none; }
+  .msg.grouped { margin-top: 2px; }
+  .msg.grouped.other .avatar { visibility: hidden; }
+  .msg.mine { justify-content: flex-end; }
+  @keyframes msg-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  .bubble-wrap { display: flex; flex-direction: column; gap: 4px; min-width: 0; max-width: min(74%, 560px); }
+  .msg.mine .bubble-wrap { align-items: flex-end; }
+  .msg-head { display: flex; align-items: baseline; gap: 8px; padding: 0 2px; }
+  .msg-name { font-size: 13.5px; font-weight: 600; letter-spacing: -0.005em; }
+  .msg-time { font-family: var(--font-mono); font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  .bubble {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 16px;
+    padding: 9px 13px; font-size: 15.5px; line-height: 1.5;
+    overflow-wrap: anywhere; white-space: pre-wrap;
+  }
+  .msg.grouped.other .bubble { border-top-left-radius: 6px; }
+  .msg.mine .bubble { background: var(--accent-tint); border-color: var(--accent-line); }
+  .msg.mine.grouped .bubble { border-top-right-radius: 6px; }
+  .bubble a {
+    color: inherit; text-decoration: underline; text-underline-offset: 2px;
+    text-decoration-color: color-mix(in oklch, var(--accent) 55%, transparent);
+    word-break: break-all;
+  }
+  .bubble a:hover { text-decoration-color: var(--accent); }
+
+  .msg-pending .bubble { opacity: 0.72; }
+  .msg-error .bubble { border-color: var(--accent); }
+  .msg-status { display: inline-flex; align-items: center; gap: 6px; font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); }
+  .msg.mine .msg-status { justify-content: flex-end; }
+  .dot-spin { width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid var(--muted); border-top-color: transparent; animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .msg-retry {
+    border: 1px solid var(--accent-line); background: var(--surface); border-radius: 999px;
+    padding: 3px 10px; font-family: var(--font-mono); font-size: 10.5px;
+    letter-spacing: 0.05em; text-transform: uppercase; color: var(--accent-ink);
+  }
+  .msg-retry:hover { background: var(--accent-tint); }
+
+  /* скелетон загрузки */
+  .skeleton { display: flex; flex-direction: column; gap: 22px; padding-top: 26px; }
+  .skeleton[hidden] { display: none; }
+  .skel { display: flex; gap: 10px; }
+  .skel-ava { display: block; width: 36px; height: 36px; border-radius: 50%; background: var(--fg-soft); flex: none; }
+  .skel-body { flex: 1; display: flex; flex-direction: column; gap: 7px; padding-top: 5px; max-width: 420px; }
+  .skel-line { display: block; height: 10px; border-radius: 5px; background: var(--fg-soft); position: relative; overflow: hidden; width: var(--w, 60%); }
+  .skel-line::after {
+    content: ""; position: absolute; inset: 0; transform: translateX(-100%);
+    background: linear-gradient(90deg, transparent, color-mix(in oklch, var(--fg) 7%, transparent), transparent);
+    animation: shimmer 1.4s ease-in-out infinite;
+  }
+  @keyframes shimmer { to { transform: translateX(100%); } }
+  .slow-note { margin: 18px auto 0; text-align: center; font-size: 13px; color: var(--muted); }
+
+  /* пустая комната */
+  .empty { margin: auto; padding: 34px 20px 20px; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 14px; }
+  .empty[hidden] { display: none; }
+  .empty-icon { width: 64px; height: 64px; color: color-mix(in oklch, var(--accent) 60%, var(--muted)); }
+  .empty-title { font-family: var(--font-display); font-size: clamp(26px, 4vw, 34px); font-weight: 600; letter-spacing: -0.02em; line-height: 1.1; }
+  .empty-text { color: var(--muted); font-size: 15px; max-width: 46ch; margin: 0; }
+
+  /* кнопка «новые сообщения» */
+  .jump {
+    position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 8px 14px; border-radius: 999px; z-index: 6;
+    border: 1px solid var(--border); background: var(--surface);
+    box-shadow: var(--shadow-pop); font-size: 13px; font-weight: 500;
+    transition: transform 120ms cubic-bezier(0.2, 0, 0, 1);
+  }
+  .jump[hidden] { display: none; }
+  .jump:hover { transform: translateX(-50%) translateY(-1px); }
+  .jump svg { width: 14px; height: 14px; color: var(--accent-ink); }
+
+  /* ─── композер ──────────────────────────────────────────────────── */
+  .composer-bar { border-top: 1px solid var(--border); background: var(--bg); padding: 12px 20px calc(10px + env(safe-area-inset-bottom, 0px)); }
+  .composer-inner { max-width: var(--chat-w); margin-inline: auto; }
+  .composer { display: flex; align-items: flex-end; gap: 10px; }
+  .composer-input {
+    flex: 1; min-height: 44px; max-height: 132px; resize: none;
+    border: 1px solid var(--border); border-radius: 14px;
+    background: var(--surface); padding: 11px 14px;
+    font-size: 15.5px; line-height: 1.45;
+  }
+  .composer-input::placeholder { color: color-mix(in oklch, var(--muted) 80%, transparent); }
+  .composer-input:focus { border-color: var(--accent); }
+
+  .send-btn {
+    width: 44px; height: 44px; flex: none; border-radius: 50%;
+    border: 1px solid var(--accent-strong); background: var(--accent-strong); color: var(--surface);
+    display: grid; place-items: center;
+    transition: background 150ms ease, border-color 150ms ease, transform 80ms ease;
+  }
+  .send-btn svg { width: 19px; height: 19px; margin-left: -1px; }
+  .send-btn:hover:not(:disabled) { background: color-mix(in oklch, var(--accent) 74%, black); border-color: color-mix(in oklch, var(--accent) 74%, black); }
+  .send-btn:active:not(:disabled) { transform: translateY(1px); }
+  .send-btn:disabled { background: var(--fg-soft); border-color: var(--border); color: color-mix(in oklch, var(--muted) 72%, transparent); cursor: not-allowed; }
+
+  .composer-meta { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 7px; min-height: 16px; }
+  .hint { font-size: 12px; color: var(--muted); }
+  .counter { font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .counter.warn { color: var(--accent-ink); }
+  .legal { margin: 7px 0 0; font-size: 11.5px; color: var(--muted); text-align: center; }
+
+  /* ─── модалки ───────────────────────────────────────────────────── */
+  .overlay {
+    position: fixed; inset: 0; z-index: 60; padding: 18px;
+    display: grid; place-items: center;
+    background: color-mix(in oklch, var(--fg) 34%, transparent);
+    backdrop-filter: blur(5px);
+    animation: fade-in 160ms ease;
+  }
+  .overlay[hidden] { display: none; }
+  .has-name #nameGate { display: none !important; }
+  @keyframes fade-in { from { opacity: 0; } }
+  .modal {
+    width: min(450px, 100%); max-height: calc(100dvh - 40px); overflow-y: auto;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 20px;
+    padding: 28px; box-shadow: var(--shadow-pop);
+    animation: pop-in 200ms cubic-bezier(0.2, 0, 0, 1);
+  }
+  @keyframes pop-in { from { opacity: 0; transform: translateY(10px) scale(0.985); } }
+  .modal-mark { width: 46px; height: 46px; margin-bottom: 16px; }
+  .modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 6px; }
+  .modal-title { font-family: var(--font-display); font-size: 26px; font-weight: 600; letter-spacing: -0.015em; line-height: 1.15; }
+  .modal-sub { color: var(--muted); font-size: 14.5px; margin: 10px 0 20px; }
+
+  .field { display: block; margin-bottom: 16px; }
+  .field-label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  .input {
+    width: 100%; padding: 11px 14px; border: 1px solid var(--border); border-radius: 10px;
+    background: var(--surface); font-size: 15px;
+  }
+  .input:focus { border-color: var(--accent); }
+  .input.is-invalid { border-color: var(--accent-ink); }
+  .field-error { display: block; color: var(--accent-ink); font-size: 12.5px; margin-top: 6px; }
+  .field-error[hidden] { display: none; }
+  .field-hint { display: block; color: var(--muted); font-size: 12.5px; margin-top: 6px; }
+
+  .switch-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 4px 0 20px; cursor: pointer; position: relative; }
+  .switch-label { font-size: 14.5px; }
+  .switch-input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .switch { position: relative; width: 42px; height: 24px; border-radius: 999px; background: var(--fg-soft); border: 1px solid var(--border); transition: background 150ms ease, border-color 150ms ease; flex: none; }
+  .switch::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%;
+    background: var(--surface); box-shadow: 0 1px 3px color-mix(in oklch, var(--fg) 25%, transparent);
+    transition: transform 150ms cubic-bezier(0.2, 0, 0, 1);
+  }
+  .switch-input:checked + .switch { background: var(--accent); border-color: var(--accent); }
+  .switch-input:checked + .switch::after { transform: translateX(18px); }
+  .switch-input:focus-visible + .switch { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .modal-actions { display: flex; justify-content: flex-end; gap: 10px; flex-wrap: wrap; }
+  .modal-foot { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12.5px; line-height: 1.55; }
+
+  /* ─── кнопки (из сида) ──────────────────────────────────────────── */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    padding: 11px 20px; border-radius: var(--radius); border: 1px solid transparent;
+    font-size: 15px; font-weight: 500; letter-spacing: -0.005em;
+    transition: transform 80ms ease, background 150ms ease, border-color 150ms ease;
+  }
+  .btn:active { transform: translateY(1px); }
+  .btn-primary { background: var(--accent-strong); color: var(--surface); border-color: var(--accent-strong); }
+  .btn-primary:hover { background: color-mix(in oklch, var(--accent) 74%, black); border-color: color-mix(in oklch, var(--accent) 74%, black); }
+  .btn-secondary { background: transparent; color: var(--fg); border-color: var(--border); }
+  .btn-secondary:hover { border-color: var(--fg); }
+  .btn-block { width: 100%; }
+
+  /* ─── тосты ─────────────────────────────────────────────────────── */
+  .toasts {
+    position: fixed; left: 50%; bottom: calc(96px + env(safe-area-inset-bottom, 0px));
+    transform: translateX(-50%); z-index: 80;
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+    width: max-content; max-width: calc(100vw - 32px); pointer-events: none;
+  }
+  .toast {
+    background: var(--fg); color: var(--bg); border-radius: 999px;
+    padding: 9px 16px; font-size: 13.5px; box-shadow: var(--shadow-pop);
+    animation: toast-in 160ms cubic-bezier(0.2, 0, 0, 1);
+    pointer-events: auto;
+  }
+  .toast.out { animation: toast-out 200ms ease forwards; }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } }
+  @keyframes toast-out { to { opacity: 0; } }
+
+  /* ─── адаптив ───────────────────────────────────────────────────── */
+  @media (max-width: 640px) {
+    .topbar-inner { padding: 9px 14px; gap: 8px; }
+    .me-name { display: none; }
+    .me-chip { padding: 3px 7px 3px 3px; }
+    .conn-text { display: none; }
+    .room-chip { max-width: 120px; }
+    .chat-inner { padding: 14px 14px 20px; }
+    .bubble-wrap { max-width: 82%; }
+    .composer-bar { padding: 10px 14px calc(8px + env(safe-area-inset-bottom, 0px)); }
+    .hint { display: none; }
+    .legal { font-size: 11px; }
+    .jump { bottom: 12px; }
+    .modal { padding: 22px; border-radius: 18px; }
+  }
+  @media (max-height: 640px) { .legal { display: none; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+    .chat-scroll { scroll-behavior: auto; }
+  }
+</style>
+</head>
+<body>
+<a class="skip-link" href="#chatScroll">Перейти к сообщениям</a>
+<noscript>
+  <style>.app { display: none; }</style>
+  <div style="max-width:520px;margin:80px auto;padding:0 20px;font-family:Georgia,serif;">
+    <h1 style="font-size:26px;letter-spacing:-0.02em;">Для чата нужен JavaScript</h1>
+    <p style="color:var(--muted);">«Поток» — клиентский сайт: сообщения летят напрямую через релей, поэтому без JavaScript он не работает. Включите его и обновите страницу.</p>
+  </div>
+</noscript>
+
+<div class="app">
+  <header class="topbar" data-od-id="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="26" height="26">
+            <rect width="32" height="32" rx="9" style="fill:var(--accent)"/>
+            <rect x="8" y="10" width="16" height="11" rx="3.5" style="fill:var(--surface)"/>
+            <path d="M11 21v4.5L16.5 21z" style="fill:var(--surface)"/>
+            <path d="M12 15.6c1.3-1.5 2.7-1.5 4 0s2.7 1.5 4 0" style="stroke:var(--accent);" stroke-width="1.7" fill="none" stroke-linecap="round"/>
+          </svg>
+        </span>
+        <span class="brand-name">Поток</span>
+        <button class="room-chip" id="roomChip" type="button" title="Комната — нажмите, чтобы сменить">
+          <span class="room-hash">#</span><span class="room-name" id="roomLabel">общий</span>
+        </button>
+      </div>
+      <div class="topbar-actions">
+        <span class="conn" id="conn" role="status" data-state="connecting">
+          <span class="conn-dot" aria-hidden="true"></span>
+          <span class="conn-text" id="connText">подключение…</span>
+        </span>
+        <button class="icon-btn" id="shareBtn" type="button" aria-label="Скопировать ссылку-приглашение" title="Скопировать ссылку-приглашение">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+        </button>
+        <button class="me-chip" id="meBtn" type="button" aria-label="Настройки: имя, комната, звук" title="Настройки">
+          <span class="avatar avatar-sm" id="meAvatar" aria-hidden="true">?</span>
+          <span class="me-name" id="meName">Гость</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="chat" id="chatMain" data-od-id="chat">
+    <div class="offline-banner" id="offlineBanner" role="status" hidden>
+      <span id="offlineText"></span>
+      <button class="btn-mini" id="retryBtn" type="button">Переподключиться</button>
+    </div>
+    <div class="notice" id="modeNotice" hidden>
+      <span id="modeNoticeText">Локальный режим превью: сообщения синхронизируются между окнами этого браузера (внешние соединения здесь заблокированы). Общий чат между устройствами включится при размещении сайта на обычном хостинге.</span>
+      <button class="icon-btn" id="modeNoticeClose" type="button" aria-label="Скрыть уведомление" title="Скрыть">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+      </button>
+    </div>
+    <div class="chat-scroll" id="chatScroll" tabindex="-1">
+      <div class="chat-inner">
+        <div class="skeleton" id="skeleton" aria-hidden="true">
+          <div class="skel"><span class="skel-ava"></span><div class="skel-body"><span class="skel-line" style="--w:52%"></span><span class="skel-line" style="--w:74%"></span></div></div>
+          <div class="skel"><span class="skel-ava"></span><div class="skel-body"><span class="skel-line" style="--w:64%"></span></div></div>
+          <div class="skel"><span class="skel-ava"></span><div class="skel-body"><span class="skel-line" style="--w:45%"></span><span class="skel-line" style="--w:38%"></span></div></div>
+        </div>
+        <div class="slow-note" id="slowNote" hidden>Релей отвечает медленно — ещё немного…</div>
+        <div class="empty" id="emptyState" hidden>
+          <svg class="empty-icon" viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linejoin="round" aria-hidden="true">
+            <rect x="8" y="14" width="48" height="30" rx="10"/>
+            <path d="M18 44v10l12-10"/>
+            <path d="M20 27h24" stroke-linecap="round" opacity="0.45"/>
+            <path d="M20 34h14" stroke-linecap="round" opacity="0.45"/>
+          </svg>
+          <h2 class="empty-title">Здесь пока тихо</h2>
+          <p class="empty-text">Напишите первое сообщение — его увидят все, кто откроет эту комнату. Сообщения появляются сверху вниз, у всех сразу.</p>
+          <button class="btn btn-secondary" id="emptyCta" type="button">Написать сообщение</button>
+        </div>
+        <div class="messages" id="chatList"></div>
+      </div>
+    </div>
+    <button class="jump" id="jumpBtn" type="button" hidden>
+      <span id="jumpText">Новые сообщения</span>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14"/><path d="m19 12-7 7-7-7"/></svg>
+    </button>
+  </main>
+
+  <footer class="composer-bar" data-od-id="composer">
+    <div class="composer-inner">
+      <form class="composer" id="composerForm" autocomplete="off">
+        <textarea class="composer-input" id="composerInput" rows="1" maxlength="1200" placeholder="Сообщение в #общий" aria-label="Текст сообщения"></textarea>
+        <button class="send-btn" id="sendBtn" type="submit" aria-label="Отправить сообщение" title="Отправить" disabled>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
+        </button>
+      </form>
+      <div class="composer-meta">
+        <span class="hint">Enter — отправить · Shift+Enter — новая строка</span>
+        <span class="counter" id="charCounter" hidden></span>
+      </div>
+      <p class="legal" id="legalLine">Демо-сайт без сервера: сообщения передаются через публичный релей ntfy.sh, история хранится ≈12 часов. Не отправляйте личные данные.</p>
+    </div>
+  </footer>
+</div>
+
+<div class="overlay" id="nameGate" role="dialog" aria-modal="true" aria-labelledby="gateTitle">
+  <div class="modal">
+    <div class="modal-mark" aria-hidden="true">
+      <svg viewBox="0 0 32 32" width="46" height="46">
+        <rect width="32" height="32" rx="10" style="fill:var(--accent)"/>
+        <rect x="8" y="10" width="16" height="11" rx="3.5" style="fill:var(--surface)"/>
+        <path d="M11 21v4.5L16.5 21z" style="fill:var(--surface)"/>
+        <path d="M12 15.6c1.3-1.5 2.7-1.5 4 0s2.7 1.5 4 0" style="stroke:var(--accent);" stroke-width="1.7" fill="none" stroke-linecap="round"/>
+      </svg>
+    </div>
+    <h1 class="modal-title" id="gateTitle">Как вас зовут?</h1>
+    <p class="modal-sub">Имя увидят все участники комнаты. Его можно сменить в любой момент — просто нажмите на кружок с именем в шапке.</p>
+    <form id="gateForm" novalidate>
+      <label class="field">
+        <span class="field-label">Ваше имя</span>
+        <input class="input" id="nameInput" name="name" maxlength="24" placeholder="Например, Никита" autocomplete="nickname" spellcheck="false" />
+        <span class="field-error" id="nameError" role="alert" hidden></span>
+      </label>
+      <button class="btn btn-primary btn-block" type="submit" id="gateSubmit">Войти в чат</button>
+    </form>
+  </div>
+</div>
+
+<div class="overlay" id="settings" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h2 class="modal-title" id="settingsTitle">Настройки</h2>
+      <button class="icon-btn" id="settingsClose" type="button" aria-label="Закрыть настройки" title="Закрыть">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+      </button>
+    </div>
+    <form id="settingsForm" novalidate>
+      <label class="field">
+        <span class="field-label">Имя</span>
+        <input class="input" id="settingsName" name="name" maxlength="24" autocomplete="nickname" spellcheck="false" />
+        <span class="field-error" id="settingsNameError" role="alert" hidden></span>
+      </label>
+      <label class="field">
+        <span class="field-label">Комната</span>
+        <input class="input" id="settingsRoom" name="room" maxlength="32" spellcheck="false" placeholder="общий" />
+        <span class="field-hint">Друзья попадут в эту же комнату по ссылке-приглашению.</span>
+      </label>
+      <label class="switch-row" for="soundToggle">
+        <span class="switch-label">Звук новых сообщений</span>
+        <input class="switch-input" type="checkbox" id="soundToggle" />
+        <span class="switch" aria-hidden="true"></span>
+      </label>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" type="button" id="copyLinkBtn">Скопировать ссылку</button>
+        <button class="btn btn-primary" type="submit">Сохранить</button>
+      </div>
+    </form>
+    <div class="modal-foot">
+      <span id="aboutHow">Как это работает: сайт статический, без бэкенда. Сообщения уходят в публичную комнату релея ntfy.sh и мгновенно раздаются всем, кто её открыл; история хранится около 12 часов. Не пишите сюда личные данные.</span>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

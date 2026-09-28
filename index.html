@@ -212,7 +212,7 @@
   .msg.mine { justify-content: flex-end; }
   @keyframes msg-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
-  .bubble-wrap { display: flex; flex-direction: column; gap: 4px; min-width: 0; max-width: min(74%, 560px); }
+  .bubble-wrap { position: relative; display: flex; flex-direction: column; gap: 4px; min-width: 0; max-width: min(74%, 560px); }
   .msg.mine .bubble-wrap { align-items: flex-end; }
   .msg-head { display: flex; align-items: baseline; gap: 8px; padding: 0 2px; }
   .msg-name { font-size: 13.5px; font-weight: 600; letter-spacing: -0.005em; }
@@ -245,6 +245,23 @@
     letter-spacing: 0.05em; text-transform: uppercase; color: var(--accent-ink);
   }
   .msg-retry:hover { background: var(--accent-tint); }
+
+  .msg-del {
+    position: absolute; top: -9px; right: -9px; z-index: 4;
+    min-width: 22px; height: 22px; padding: 0;
+    border-radius: 999px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--muted);
+    font-size: 13px; line-height: 1; display: grid; place-items: center;
+    opacity: 0;
+    transition: opacity 140ms ease, color 140ms ease, border-color 140ms ease, background 140ms ease;
+  }
+  .msg:hover .msg-del, .msg-del:focus-visible { opacity: 1; }
+  .msg-del:hover { color: var(--accent-ink); border-color: var(--accent-line); }
+  .msg-del.armed {
+    opacity: 1; padding: 0 9px; font-size: 11px;
+    color: var(--accent-ink); border-color: var(--accent-line); background: var(--accent-tint);
+  }
+  @media (hover: none) { .msg-del { opacity: 0.5; } }
 
   /* скелетон загрузки */
   .skeleton { display: flex; flex-direction: column; gap: 22px; padding-top: 26px; }

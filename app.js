@@ -40,6 +40,7 @@
   };
 
   let channel = null;        // realtime-канал текущей комнаты
+  let currentUser = null;    // текущий пользователь сессии (для «моё/не моё»)
   let loadTimer = null;
   let slowTimer = null;
   let audioCtx = null;
@@ -75,6 +76,22 @@
     if (label.length > 32) label = label.slice(0, 32);
     if (!label || label.toLowerCase() === DEFAULT_ROOM) label = DEFAULT_ROOM;
     return label;
+  }
+
+  // Имя по умолчанию: «Гость-Сова» и т.п. — стабильно для устройства, без вопросов
+  const GUEST_WORDS = ['Сова', 'Лис', 'Ёж', 'Кот', 'Барсук', 'Выдра', 'Грач', 'Дрозд', 'Олень', 'Хорёк', 'Соболь', 'Филин'];
+  function defaultGuestName() {
+    let seed = (currentUser && currentUser.id) || safeGet('potok.v1.seed');
+    if (!seed) { seed = String(Math.random()) + String(Date.now()); safeSet('potok.v1.seed', seed); }
+    let h = 0;
+    for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) | 0;
+    return 'Гость-' + GUEST_WORDS[Math.abs(h) % GUEST_WORDS.length];
+  }
+
+  // «Моё» сообщение определяем по user_id сессии (надёжнее, чем сравнение имён)
+  function isMine(userId, name) {
+    if (userId && currentUser && currentUser.id) return userId === currentUser.id;
+    return (name || '') === state.name;
   }
 
   // Идентичность: цвет аватара выводится из имени — одинаков у всех участников
@@ -141,10 +158,6 @@
   const meBtn = $('meBtn');
   const meAvatar = $('meAvatar');
   const meName = $('meName');
-  const nameGate = $('nameGate');
-  const gateForm = $('gateForm');
-  const nameInput = $('nameInput');
-  const nameError = $('nameError');
   const passGate = $('passGate');
   const passForm = $('passForm');
   const passInput = $('passInput');
@@ -468,9 +481,10 @@
   async function ensureSession() {
     if (!sb) throw new Error('no-supabase-client');
     const cur = await sb.auth.getSession();
-    if (cur && cur.data && cur.data.session) return;
+    if (cur && cur.data && cur.data.session) { currentUser = cur.data.session.user; return; }
     const anon = await sb.auth.signInAnonymously();
     if (anon.error) throw anon.error;
+    currentUser = (anon.data && anon.data.user) || null;
   }
 
   let sessionPromise = null;
@@ -522,7 +536,6 @@
   function showPassGate() {
     document.documentElement.classList.remove('has-session');
     passGate.hidden = false;
-    nameGate.hidden = true;
     setConn('connecting');
     setTimeout(() => passInput.focus(), 80);
   }
@@ -534,14 +547,14 @@
     document.documentElement.classList.add('has-session');
     passGate.hidden = true;
     hideBanner();
-    if (state.name) {
-      nameGate.hidden = true;
-    } else {
-      openGate();
+    ensureAudio();
+    if (!state.name) {
+      applyName(defaultGuestName());
+      addNote('Вы в чате как «' + state.name + '» — имя можно поменять в настройках');
     }
     if (state.msgCount === 0) maybeShowEmpty();
     loadRoom();
-    if (state.name) setTimeout(() => composerInput.focus(), 120);
+    setTimeout(() => composerInput.focus(), 120);
   }
 
   passForm.addEventListener('submit', async (e) => {
@@ -587,15 +600,15 @@
         if (p.st && p.st.isConnected) p.st.remove();
       }
       attachMessageId(p.el, id);
-      addToCache({ id, n: row.author, t: Date.parse(row.created_at), x: row.body });
+      addToCache({ id, n: row.author, t: Date.parse(row.created_at), x: row.body, u: row.user_id || null });
       return;
     }
     const name = (typeof row.author === 'string' && row.author.trim()) || 'Гость';
     const time = row.created_at ? Date.parse(row.created_at) : Date.now();
-    const mine = name === state.name;
+    const mine = isMine(row.user_id, name);
     renderMessage({ name, text: row.body || '', time, mine, noAnim: !!quiet, id });
     state.seen.add(id);
-    addToCache({ id, n: name, t: time, x: row.body || '' });
+    addToCache({ id, n: name, t: time, x: row.body || '', u: row.user_id || null });
     if (quiet) return;
     const age = Date.now() - time;
     if (!mine && age < LIVE_WINDOW) {
@@ -637,7 +650,7 @@
     try {
       const { data, error } = await sb
         .from('potok_messages')
-        .select('id, room, author, body, client_msg_id, created_at')
+        .select('id, room, author, body, client_msg_id, user_id, created_at')
         .eq('room', state.room)
         .order('created_at', { ascending: false })
         .limit(HISTORY_LIMIT);
@@ -692,7 +705,7 @@
         state.seen.add(id);
         if (p.el.isConnected) { p.el.classList.remove('msg-pending'); if (p.st && p.st.isConnected) p.st.remove(); }
         attachMessageId(p.el, id);
-        addToCache({ id, n: state.name, t: p.time, x: p.text });
+        addToCache({ id, n: state.name, t: p.time, x: p.text, u: (currentUser && currentUser.id) || null });
       }
     } catch (err) {
       p.failed = true;
@@ -712,8 +725,8 @@
   }
 
   function sendText(text) {
-    if (!state.name) { openGate(); return; }
     if (!state.joined) { toast('Сначала войдите в чат по коду доступа.'); showPassGate(); return; }
+    if (!state.name) applyName(defaultGuestName());
     const t0 = Date.now();
     const cmid = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (t0 + '-' + Math.random().toString(16).slice(2));
     const built = renderMessage({ name: state.name, text, time: t0, mine: true, pending: true });
@@ -787,35 +800,6 @@
     meName.textContent = name;
     paintAvatar(meAvatar, name);
   }
-  function openGate() {
-    nameGate.hidden = false;
-    nameInput.value = state.name || nameInput.value;
-    setTimeout(() => nameInput.focus(), 80);
-  }
-  function hideGate() {
-    nameGate.hidden = true;
-    try { document.documentElement.classList.add('has-name'); } catch (e) {}
-  }
-
-  gateForm.addEventListener('submit', (e) => {
-    e.preventDefault();
-    const v = nameInput.value.trim();
-    const err = validateName(v);
-    if (err) { showFieldError(nameInput, nameError, err); nameInput.focus(); return; }
-    clearFieldError(nameInput, nameError);
-    applyName(v);
-    hideGate();
-    ensureAudio();
-    addNote('Вы вошли в комнату «' + state.room + '»');
-    composerInput.focus();
-  });
-  nameInput.addEventListener('input', () => {
-    if (!nameError.hidden) {
-      const err = validateName(nameInput.value.trim());
-      if (!err) clearFieldError(nameInput, nameError);
-    }
-  });
-
   function openSettings(focusRoom) {
     settingsName.value = state.name;
     settingsRoom.value = state.room;
@@ -938,7 +922,8 @@
     for (const it of items) {
       if (!it || !it.id || state.seen.has(it.id)) continue;
       state.seen.add(it.id);
-      renderMessage({ name: it.n || 'Гость', text: it.x || '', time: it.t || Date.now(), mine: (it.n || '') === state.name, noAnim: true, id: it.id });
+      const cachedMine = isMine(it.u || null, it.n || '');
+      renderMessage({ name: it.n || 'Гость', text: it.x || '', time: it.t || Date.now(), mine: cachedMine, noAnim: true, id: it.id });
       count++;
     }
     if (count) {
@@ -960,7 +945,6 @@
     syncRoomUI();
     soundToggle.checked = state.sound;
 
-    if (state.name) document.documentElement.classList.add('has-name');
     renderCached();
     updateSendState();
     startAccess();

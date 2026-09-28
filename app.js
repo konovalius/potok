@@ -1,47 +1,47 @@
 /*
-  «Поток» — общий чат. Логика клиента.
-  Транспорт: публичный релей ntfy.sh (JSON POST на отправку + SSE на приём).
-  Без серверного кода: сайт статический, вся синхронизация — через релей.
+  «Поток» — закрытый общий чат. Логика клиента.
+  Транспорт: приватная база Supabase (анонимная сессия + код доступа + защита на уровне строк).
+  Без серверного кода: сайт статический; доступ и хранение обеспечивает база.
 */
 (() => {
   'use strict';
 
-  // ── Константы ───────────────────────────────────────────────
-  const RELAY = 'https://ntfy.sh';
-  const TOPIC_PREFIX = 'autoclaw-chat-ru-';
+  // ── Конфигурация ────────────────────────────────────────────
+  const CONF = window.POTOK_CONFIG || {};
+  const sb = (window.supabase && CONF.supabaseUrl && CONF.supabaseAnonKey)
+    ? window.supabase.createClient(CONF.supabaseUrl, CONF.supabaseAnonKey)
+    : null;
+
   const DEFAULT_ROOM = 'общий';
-  const DEFAULT_TOPIC = 'general';
-  const MAX_TEXT = 1200;
+  const MAX_TEXT = 2000;
   const CACHE_LIMIT = 80;
   const DOM_LIMIT = 300;
+  const HISTORY_LIMIT = 300;
   const GROUP_WINDOW = 5 * 60 * 1000; // 5 минут — окно склейки сообщений одного автора
   const LIVE_WINDOW = 60 * 1000;      // старше минуты — считаем историей (без звука и счётчика)
-  const LS = { name: 'potok.v1.name', sound: 'potok.v1.sound', room: 'potok.v1.room', auth: 'potok.v1.auth' };
-  const PASS_HASH = 'c6b36a3e88c6a6d89a766c3a0b269c344b8d1fe72cac8007029ce597b2674307'; // SHA-256 от "potok.v1|пароль"
+  const LS = { name: 'potok.v1.name', sound: 'potok.v1.sound', room: 'potok.v1.room' };
+  const CACHE_PREFIX = 'potok.v2.cache.';
 
   // ── Состояние ───────────────────────────────────────────────
   const state = {
     name: '',
     sound: true,
     room: DEFAULT_ROOM,
-    seen: new Set(),        // id сообщений, уже отрисованных (дедупликация SSE-реплеев)
-    pending: new Map(),     // tmpId -> { el, st, text, tries, failed }
+    seen: new Set(),        // id сообщений (строк базы), уже отрисованных
+    pending: new Map(),     // client_msg_id -> { el, st, text, time, failed, reconciled }
     unread: 0,
     msgCount: 0,
     lastDay: '',
     lastAuthor: '',
     lastTime: 0,
-    connectedOnce: false,
-    gotData: false,
+    joined: false,
     baseTitle: 'Поток — общий чат'
   };
 
-  let es = null;
+  let channel = null;        // realtime-канал текущей комнаты
+  let loadTimer = null;
   let slowTimer = null;
-  let failTimer = null;
   let audioCtx = null;
-  let localCh = null;
-  let transportStarted = false;
 
   // ── Помощники ───────────────────────────────────────────────
   const $ = (id) => document.getElementById(id);
@@ -57,12 +57,7 @@
   const safeSGet = (k) => { try { return sessionStorage.getItem(k); } catch (e) { return null; } };
   const safeSSet = (k, v) => { try { sessionStorage.setItem(k, v); } catch (e) {} };
 
-  async function sha256Hex(text) {
-    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-    return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
-  }
-
-  // Транслитерация для темы комнаты (в темах ntfy допустимы только [a-zA-Z0-9_-])
+  // Ключи комнат для кэша/каналов (в комнатах допустимы любые буквы — оставляем слаг для единообразия)
   const TRANSLIT = { а:'a',б:'b',в:'v',г:'g',д:'d',е:'e',ё:'e',ж:'zh',з:'z',и:'i',й:'y',к:'k',л:'l',м:'m',н:'n',о:'o',п:'p',р:'r',с:'s',т:'t',у:'u',ф:'f',х:'h',ц:'c',ч:'ch',ш:'sh',щ:'sch',ъ:'',ы:'y',ь:'',э:'e',ю:'yu',я:'ya' };
   function slugifyRoom(label) {
     let out = '';
@@ -73,9 +68,6 @@
     }
     out = out.replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 48);
     return out || 'room';
-  }
-  function topicFor(room) {
-    return TOPIC_PREFIX + (room === DEFAULT_ROOM ? DEFAULT_TOPIC : slugifyRoom(room));
   }
   function normalizeRoom(raw) {
     let label = String(raw || '').trim().replace(/\s+/g, ' ');
@@ -152,6 +144,11 @@
   const gateForm = $('gateForm');
   const nameInput = $('nameInput');
   const nameError = $('nameError');
+  const passGate = $('passGate');
+  const passForm = $('passForm');
+  const passInput = $('passInput');
+  const passError = $('passError');
+  const passSubmit = $('passSubmit');
   const settings = $('settings');
   const settingsForm = $('settingsForm');
   const settingsName = $('settingsName');
@@ -161,14 +158,6 @@
   const settingsClose = $('settingsClose');
   const copyLinkBtn = $('copyLinkBtn');
   const toasts = $('toasts');
-  const modeNotice = $('modeNotice');
-  const modeNoticeClose = $('modeNoticeClose');
-  const legalLine = $('legalLine');
-  const aboutHow = $('aboutHow');
-  const passGate = $('passGate');
-  const passForm = $('passForm');
-  const passInput = $('passInput');
-  const passError = $('passError');
 
   // ── Звук ────────────────────────────────────────────────────
   function ensureAudio() {
@@ -242,19 +231,13 @@
   });
 
   // ── Статус соединения и баннер ──────────────────────────────
-  const CONN_TEXT = { connecting: 'подключение…', online: 'в сети', reconnecting: 'переподключение…', error: 'нет связи', local: 'локально' };
+  const CONN_TEXT = { connecting: 'подключение…', online: 'в сети', reconnecting: 'переподключение…', error: 'нет связи' };
   function setConn(mode) {
     connBox.dataset.state = mode;
     connText.textContent = CONN_TEXT[mode] || mode;
   }
   function showBanner(text) { offlineText.textContent = text; offlineBanner.hidden = false; }
   function hideBanner() { offlineBanner.hidden = true; }
-
-  function clearTimers() { clearTimeout(slowTimer); clearTimeout(failTimer); }
-
-  retryBtn.addEventListener('click', () => { hideBanner(); connect(); });
-  modeNoticeClose.addEventListener('click', () => { modeNotice.hidden = true; safeSet('potok.v1.notice_off', '1'); });
-  emptyCta.addEventListener('click', () => composerInput.focus());
 
   // ── Пустая комната / скелетон ───────────────────────────────
   function removeSkeleton() {
@@ -266,8 +249,8 @@
   }
   function hideEmpty() { if (!emptyState.hidden) emptyState.hidden = true; }
 
-  // ── Кэш сообщений (мгновенная отрисовка и офлайн-чтение) ────
-  const cacheKey = () => 'potok.v1.cache.' + topicFor(state.room);
+  // ── Кэш сообщений (мгновенная отрисовка) ────────────────────
+  const cacheKey = () => CACHE_PREFIX + slugifyRoom(state.room);
   function loadCache() {
     try {
       const raw = safeGet(cacheKey());
@@ -378,112 +361,6 @@
     return { row, st };
   }
 
-  // ── Сеть: подписка (SSE) ────────────────────────────────────
-  function connect() {
-    if (state.mode === 'local') return;
-    if (es) { es.close(); es = null; }
-    setConn('connecting');
-    clearTimers();
-    slowTimer = setTimeout(() => { if (!state.gotData) slowNote.hidden = false; }, 12000);
-    failTimer = setTimeout(() => {
-      if (!state.connectedOnce) {
-        setConn('error');
-        showBanner('Нет ответа от релея. Проверьте интернет — мы продолжаем попытки.');
-        maybeShowEmpty();
-      }
-    }, 25000);
-
-    try {
-      es = new EventSource(RELAY + '/' + topicFor(state.room) + '/sse?since=12h');
-    } catch (e) {
-      setConn('error');
-      showBanner('Не удалось подключиться к релею.');
-      return;
-    }
-
-    es.addEventListener('open', () => {
-      state.connectedOnce = true;
-      state.gotData = true;
-      clearTimers();
-      slowNote.hidden = true;
-      setConn('online');
-      hideBanner();
-      removeSkeleton();
-      maybeShowEmpty();
-      flushFailed();
-    });
-
-    es.addEventListener('message', onRelayMessage);
-
-    es.addEventListener('error', () => {
-      if (state.connectedOnce) {
-        setConn('reconnecting');
-        showBanner('Связь с релеем пропала — сообщения могут не доходить. Переподключаемся…');
-      } else {
-        setConn('connecting');
-      }
-      // EventSource переподключается сам; кнопка «Переподключиться» ускоряет процесс
-    });
-  }
-
-  function onRelayMessage(ev) {
-    let d = null;
-    try { d = JSON.parse(ev.data); } catch (e) { return; }
-    if (!d || d.event !== 'message' || !d.id) return;
-
-    state.gotData = true;
-    slowNote.hidden = true;
-
-    if (state.seen.has(d.id)) return; // реплей истории — уже видели
-
-    const name = (typeof d.title === 'string' && d.title.trim()) || 'Гость';
-    const text = typeof d.message === 'string' ? d.message : '';
-    const time = typeof d.time === 'number' ? d.time * 1000 : Date.now();
-
-    // Эхо собственного сообщения: переиспользуем оптимистичный пузырь,
-    // чтобы не задвоить сообщение и не сломать группировку с соседями.
-    if (name === state.name) {
-      for (const [tmpId, p] of state.pending) {
-        if (!p.delivered && p.text === text && Math.abs(time - p.time) < 120000) {
-          p.delivered = true;
-          state.seen.add(d.id);
-          state.pending.delete(tmpId);
-          if (p.el.isConnected) {
-            p.el.classList.remove('msg-pending', 'msg-error');
-            if (p.st && p.st.isConnected) p.st.remove();
-          }
-          removeSkeleton();
-          addToCache({ id: d.id, n: name, t: time, x: text });
-          return;
-        }
-      }
-    }
-
-    state.seen.add(d.id);
-    const mine = name === state.name;
-
-    renderMessage({ name, text, time, mine });
-    removeSkeleton();
-    addToCache({ id: d.id, n: name, t: time, x: text });
-
-    const age = Date.now() - time;
-    if (!mine && age < LIVE_WINDOW) {
-      blip();
-      if (document.hidden || !isNearBottom()) {
-        state.unread++;
-      }
-      updateUnreadUI();
-    }
-  }
-
-  // ── Сеть: отправка ──────────────────────────────────────────
-  async function fetchTimeout(url, opts, ms) {
-    const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), ms);
-    try { return await fetch(url, Object.assign({}, opts, { signal: ctl.signal })); }
-    finally { clearTimeout(t); }
-  }
-
   function setStatusNode(p, mode) {
     if (!p.st || !p.st.isConnected) return;
     p.st.textContent = '';
@@ -498,186 +375,255 @@
     }
   }
 
-  async function attemptPublish(tmpId) {
-    const p = state.pending.get(tmpId);
-    if (!p) return;
-    if (state.mode === 'local') { localPublish(tmpId); return; }
-    p.tries++;
+  // ── Доступ: сессия → членство → код ─────────────────────────
+  function accessFail(text) {
+    setConn('error');
+    showBanner(text);
+  }
+
+  function setGateBusy(busy, label) {
+    if (!passSubmit) return;
+    passSubmit.disabled = busy;
+    passSubmit.textContent = busy ? label : 'Войти';
+  }
+
+  async function ensureSession() {
+    if (!sb) throw new Error('no-supabase-client');
+    const cur = await sb.auth.getSession();
+    if (cur && cur.data && cur.data.session) return;
+    const anon = await sb.auth.signInAnonymously();
+    if (anon.error) throw anon.error;
+  }
+
+  async function checkMember() {
+    const r = await sb.rpc('potok_is_member');
+    if (r.error) throw r.error;
+    return r.data === true;
+  }
+
+  async function tryJoin(code) {
+    const r = await sb.rpc('potok_join', { p_code: code });
+    if (r.error) throw r.error;
+    return r.data === true;
+  }
+
+  const BLOCKED_HINT = 'Похоже, эта площадка блокирует подключения базе. Откройте рабочую версию: konovalius.github.io/potok';
+  function blockedHintNeeded() { return /autoclawai\.space$/i.test(location.hostname); }
+
+  async function startAccess() {
+    setConn('connecting');
+    setGateBusy(false);
+    clearTimeout(slowTimer);
+    slowTimer = setTimeout(() => { if (!state.joined) slowNote.hidden = false; }, 9000);
+    if (!sb) { clearTimeout(slowTimer); accessFail('Не удалось загрузить клиент базы — обновите страницу.'); return; }
     try {
-      const res = await fetchTimeout(RELAY + '/', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ topic: topicFor(state.room), title: state.name, message: p.text })
-      }, 12000);
-      if (!res.ok) { const err = new Error('HTTP ' + res.status); err.status = res.status; throw err; }
-      const info = await res.json().catch(() => null);
-      state.pending.delete(tmpId);
-      if (p.delivered) return; // эхо уже финализировало пузырь (гонка POST/SSE)
-      if (info && info.id && state.seen.has(info.id)) {
-        if (p.el.isConnected) { p.el.remove(); state.msgCount--; } // эхо уже пришло раньше — временный пузырь не нужен
+      await ensureSession();
+    } catch (e) {
+      clearTimeout(slowTimer);
+      accessFail(blockedHintNeeded() ? BLOCKED_HINT : 'Нет связи с базой — проверьте интернет и нажмите «Переподключиться».');
+      return;
+    }
+    let member = false;
+    try { member = await checkMember(); } catch (e) { member = false; }
+    clearTimeout(slowTimer);
+    if (member) {
+      enterChat();
+    } else {
+      showPassGate();
+    }
+  }
+
+  function showPassGate() {
+    document.documentElement.classList.remove('has-session');
+    passGate.hidden = false;
+    nameGate.hidden = true;
+    setConn('connecting');
+    setTimeout(() => passInput.focus(), 80);
+  }
+
+  function enterChat() {
+    state.joined = true;
+    clearTimeout(slowTimer);
+    removeSkeleton();
+    document.documentElement.classList.add('has-session');
+    passGate.hidden = true;
+    hideBanner();
+    if (state.name) {
+      nameGate.hidden = true;
+    } else {
+      openGate();
+    }
+    if (state.msgCount === 0) maybeShowEmpty();
+    loadRoom();
+    if (state.name) setTimeout(() => composerInput.focus(), 120);
+  }
+
+  passForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const v = passInput.value.trim();
+    if (!v) { showFieldError(passInput, passError, 'Введите код доступа.'); passInput.focus(); return; }
+    clearFieldError(passInput, passError);
+    setGateBusy(true, 'Проверяем…');
+    try {
+      const ok = await tryJoin(v);
+      if (ok) {
+        hideBanner();
+        document.documentElement.classList.add('has-session');
+        enterChat();
       } else {
-        if (info && info.id) state.seen.add(info.id); // чтобы эхо не задвоило
-        if (p.el.isConnected) {
-          p.el.classList.remove('msg-pending');
-          if (p.st && p.st.isConnected) p.st.remove();
-        }
-        addToCache({ id: (info && info.id) || tmpId, n: state.name, t: Date.now(), x: p.text });
+        showFieldError(passInput, passError, 'Неверный код — попробуйте ещё раз.');
+        passInput.select();
       }
     } catch (err) {
-      if (p.delivered) return; // сообщение уже доставлено, несмотря на сбой чтения ответа
-      const retryable = !err.status || err.status >= 500 || err.status === 429 || err.name === 'AbortError';
-      if (p.tries < 3 && retryable) {
-        setTimeout(() => attemptPublish(tmpId), 900 * p.tries);
-      } else {
-        p.failed = true;
-        if (p.el.isConnected) {
-          p.el.classList.add('msg-error');
-          p.el.classList.remove('msg-pending');
-        }
-        setStatusNode(p, 'failed');
-        toast(err.status === 429
-          ? 'Слишком часто — подождите пару секунд и нажмите «повторить»'
-          : 'Сообщение не отправилось. Нажмите «повторить» под ним.');
+      showFieldError(passInput, passError, blockedHintNeeded() ? 'Площадка блокирует соединения — откройте рабочую версию.' : 'Нет связи с базой — проверьте интернет.');
+    } finally {
+      setGateBusy(false);
+    }
+  });
+  passInput.addEventListener('input', () => { if (!passError.hidden) clearFieldError(passInput, passError); });
+
+  // ── Комнаты: загрузка из базы и realtime ────────────────────
+  function rowToMessage(row, quiet) {
+    const id = String(row.id);
+    if (state.seen.has(id)) return;
+    const cmid = row.client_msg_id;
+    if (cmid && state.pending.has(cmid)) {
+      // эхо собственного сообщения — финализируем оптимистичный пузырь
+      const p = state.pending.get(cmid);
+      p.reconciled = true;
+      state.pending.delete(cmid);
+      state.seen.add(id);
+      if (p.el.isConnected) {
+        p.el.classList.remove('msg-pending', 'msg-error');
+        if (p.st && p.st.isConnected) p.st.remove();
       }
+      addToCache({ id, n: row.author, t: Date.parse(row.created_at), x: row.body });
+      return;
     }
-  }
-
-  function retryMessage(tmpId) {
-    const p = state.pending.get(tmpId);
-    if (!p) return;
-    p.failed = false;
-    p.tries = 0;
-    if (p.el.isConnected) {
-      p.el.classList.remove('msg-error');
-      p.el.classList.add('msg-pending');
-    }
-    setStatusNode(p, 'pending');
-    attemptPublish(tmpId);
-  }
-
-  function flushFailed() {
-    state.pending.forEach((p, id) => {
-      if (p.failed) retryMessage(id);
-    });
-  }
-
-  // ── Транспорт: релей или локальный режим ────────────────
-  async function probeRelay() {
-    try {
-      const ctl = new AbortController();
-      const t = setTimeout(() => ctl.abort(), 4000);
-      try {
-        // режим no-cors: достаточно проверить достижимость, тело не нужно
-        await fetch(RELAY + '/v1/health', { mode: 'no-cors', cache: 'no-store', signal: ctl.signal });
-        return true;
-      } finally {
-        clearTimeout(t);
-      }
-    } catch (e) {
-      return false;
-    }
-  }
-
-  async function initTransport() {
-    setConn('connecting');
-    const reachable = await probeRelay();
-    if (reachable) {
-      state.mode = 'relay';
-      updateModeTexts();
-      connect();
-    } else {
-      startLocalMode();
-    }
-  }
-
-  function ensureTransport() {
-    if (!transportStarted) { transportStarted = true; initTransport(); }
-  }
-
-  function startLocalMode() {
-    state.mode = 'local';
-    clearTimers();
-    hideBanner();
-    removeSkeleton();
-    maybeShowEmpty();
-    setConn('local');
-    updateModeTexts();
-    openLocalChannel();
-    if (!safeGet('potok.v1.notice_off')) modeNotice.hidden = false;
-  }
-
-  function openLocalChannel() {
-    closeLocalChannel();
-    try {
-      localCh = new BroadcastChannel('potok.v1.' + topicFor(state.room));
-      localCh.addEventListener('message', onLocalMessage);
-    } catch (e) {
-      localCh = null; // экзотический браузер без BroadcastChannel
-    }
-  }
-
-  function closeLocalChannel() {
-    if (localCh) { try { localCh.close(); } catch (e) {} localCh = null; }
-  }
-
-  function onLocalMessage(ev) {
-    const d = ev && ev.data;
-    if (!d || d.type !== 'msg' || !d.body || !d.body.id) return;
-    const m = d.body;
-    if (state.seen.has(m.id)) return;
-    state.seen.add(m.id);
-    const name = (typeof m.title === 'string' && m.title.trim()) || 'Гость';
-    const text = typeof m.message === 'string' ? m.message : '';
-    const time = typeof m.time === 'number' ? m.time * 1000 : Date.now();
+    const name = (typeof row.author === 'string' && row.author.trim()) || 'Гость';
+    const time = row.created_at ? Date.parse(row.created_at) : Date.now();
     const mine = name === state.name;
-    renderMessage({ name, text, time, mine });
-    removeSkeleton();
-    addToCache({ id: m.id, n: name, t: time, x: text });
-    if (!mine) {
+    renderMessage({ name, text: row.body || '', time, mine, noAnim: !!quiet });
+    state.seen.add(id);
+    addToCache({ id, n: name, t: time, x: row.body || '' });
+    if (quiet) return;
+    const age = Date.now() - time;
+    if (!mine && age < LIVE_WINDOW) {
       blip();
       if (document.hidden || !isNearBottom()) state.unread++;
       updateUnreadUI();
     }
   }
 
-  function updateModeTexts() {
-    const local = state.mode === 'local';
-    legalLine.textContent = local
-      ? 'Локальный режим: сообщения живут в этом браузере и синхронизируются между его окнами.'
-      : 'Демо-сайт без сервера: сообщения передаются через публичный релей ntfy.sh, история хранится ≈12 часов. Не отправляйте личные данные.';
-    aboutHow.textContent = local
-      ? 'Как это работает: сейчас включён локальный режим — превью блокирует внешние соединения, поэтому сообщения синхронизируются между окнами этого браузера. При размещении сайта на обычном хостинге включится сетевой режим с общей комнатой.'
-      : 'Как это работает: сайт статический, без бэкенда. Сообщения уходят в публичную комнату релея ntfy.sh и мгновенно раздаются всем, кто её открыл; история хранится около 12 часов. Не пишите сюда личные данные.';
+  function unsubscribeChannel() {
+    if (channel) { try { sb.removeChannel(channel); } catch (e) {} channel = null; }
   }
 
-  function localPublish(tmpId) {
-    const p = state.pending.get(tmpId);
-    if (!p) return;
-    const d = { id: 'loc-' + tmpId, title: state.name, message: p.text, time: Math.round(p.time / 1000) };
+  function subscribeRoom() {
+    unsubscribeChannel();
+    if (!sb || !state.joined) return;
+    channel = sb.channel('potok-' + slugifyRoom(state.room));
+    channel
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'potok_messages' }, (payload) => {
+        const row = payload && payload.new;
+        if (!row || row.room !== state.room) return;
+        rowToMessage(row, false);
+      })
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') { setConn('online'); hideBanner(); }
+        else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') { setConn('reconnecting'); }
+      });
+  }
+
+  async function loadRoom() {
+    if (!sb || !state.joined) return;
+    const roomToken = state.room;
+    setConn('connecting');
     try {
-      if (localCh) localCh.postMessage({ type: 'msg', body: d });
-      state.pending.delete(tmpId);
-      state.seen.add(d.id);
-      if (p.el.isConnected) {
-        p.el.classList.remove('msg-pending');
-        if (p.st && p.st.isConnected) p.st.remove();
+      const { data, error } = await sb
+        .from('potok_messages')
+        .select('id, room, author, body, client_msg_id, created_at')
+        .eq('room', state.room)
+        .order('created_at', { ascending: false })
+        .limit(HISTORY_LIMIT);
+      if (error) throw error;
+      if (state.room !== roomToken) return;
+      const rows = (data || []).slice().reverse();
+      let count = 0;
+      for (const row of rows) {
+        const before = state.msgCount;
+        rowToMessage(row, true);
+        if (state.msgCount > before) count++;
       }
-      addToCache({ id: d.id, n: state.name, t: p.time, x: p.text });
+      removeSkeleton();
+      if (state.msgCount === 0) maybeShowEmpty(); else hideEmpty();
+      if (count) requestAnimationFrame(() => scrollToBottom('auto'));
+      clearTimeout(loadTimer);
+      hideBanner();
+      subscribeRoom();
     } catch (e) {
+      if (state.room !== roomToken) return;
+      setConn('error');
+      showBanner('Нет связи с базой — проверьте интернет. Пробуем ещё раз…');
+      clearTimeout(loadTimer);
+      loadTimer = setTimeout(() => { if (state.joined && state.room === roomToken) loadRoom(); }, 6000);
+    }
+  }
+
+  // ── Отправка ────────────────────────────────────────────────
+  async function publish(cmid) {
+    const p = state.pending.get(cmid);
+    if (!p) return;
+    try {
+      const { data, error } = await sb
+        .from('potok_messages')
+        .insert({ room: state.room, author: state.name, body: p.text, client_msg_id: cmid })
+        .select('id, author, created_at, client_msg_id')
+        .single();
+      if (error) {
+        if (error.code === '23505') { // повторная вставка после сбоя — уже доставлено
+          state.pending.delete(cmid);
+          if (p.el.isConnected) { p.el.classList.remove('msg-pending'); if (p.st && p.st.isConnected) p.st.remove(); }
+          return;
+        }
+        throw error;
+      }
+      const id = String(data.id);
+      if (p.reconciled) return; // realtime уже финализировал этот пузырь
+      state.pending.delete(cmid);
+      if (state.seen.has(id)) {
+        if (p.el.isConnected) { p.el.remove(); state.msgCount--; }
+      } else {
+        state.seen.add(id);
+        if (p.el.isConnected) { p.el.classList.remove('msg-pending'); if (p.st && p.st.isConnected) p.st.remove(); }
+        addToCache({ id, n: state.name, t: p.time, x: p.text });
+      }
+    } catch (err) {
       p.failed = true;
       if (p.el.isConnected) { p.el.classList.add('msg-error'); p.el.classList.remove('msg-pending'); }
       setStatusNode(p, 'failed');
+      toast('Сообщение не отправилось. Нажмите «повторить» под ним.');
     }
+  }
+
+  function retryMessage(cmid) {
+    const p = state.pending.get(cmid);
+    if (!p) return;
+    p.failed = false;
+    if (p.el.isConnected) { p.el.classList.remove('msg-error'); p.el.classList.add('msg-pending'); }
+    setStatusNode(p, 'pending');
+    publish(cmid);
   }
 
   function sendText(text) {
     if (!state.name) { openGate(); return; }
+    if (!state.joined) { toast('Сначала войдите в чат по коду доступа.'); showPassGate(); return; }
     const t0 = Date.now();
-    const tmpId = 't' + (window.crypto && crypto.randomUUID ? crypto.randomUUID() : t0 + '-' + Math.random().toString(16).slice(2));
+    const cmid = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (t0 + '-' + Math.random().toString(16).slice(2));
     const built = renderMessage({ name: state.name, text, time: t0, mine: true, pending: true });
-    const p = { id: tmpId, el: built.row, st: built.st, text, time: t0, tries: 0, failed: false, delivered: false };
-    state.pending.set(tmpId, p);
-    attemptPublish(tmpId);
+    const p = { id: cmid, el: built.row, st: built.st, text, time: t0, failed: false, reconciled: false };
+    state.pending.set(cmid, p);
+    publish(cmid);
   }
 
   // ── Композер ────────────────────────────────────────────────
@@ -754,39 +700,6 @@
     nameGate.hidden = true;
     try { document.documentElement.classList.add('has-name'); } catch (e) {}
   }
-
-  function afterAuth() {
-    document.documentElement.classList.remove('no-auth');
-    document.documentElement.classList.add('has-auth');
-    passGate.hidden = true;
-    ensureTransport();
-    if (state.name) {
-      nameGate.hidden = true;
-    } else {
-      openGate();
-    }
-  }
-
-  passForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const v = passInput.value;
-    if (!v) { showFieldError(passInput, passError, 'Введите пароль.'); passInput.focus(); return; }
-    if (!window.crypto || !crypto.subtle) {
-      showFieldError(passInput, passError, 'Не удалось проверить пароль в этом браузере.');
-      return;
-    }
-    let ok = false;
-    try { ok = (await sha256Hex('potok.v1|' + v)) === PASS_HASH; } catch (err) { ok = false; }
-    if (!ok) {
-      showFieldError(passInput, passError, 'Неверный пароль — попробуйте ещё раз.');
-      passInput.select();
-      return;
-    }
-    clearFieldError(passInput, passError);
-    safeSet(LS.auth, '1');
-    afterAuth();
-  });
-  passInput.addEventListener('input', () => { if (!passError.hidden) clearFieldError(passInput, passError); });
 
   gateForm.addEventListener('submit', (e) => {
     e.preventDefault();
@@ -879,25 +792,16 @@
     state.lastDay = '';
     state.lastAuthor = '';
     state.lastTime = 0;
-    state.connectedOnce = false;
-    state.gotData = false;
     state.unread = 0;
+    jumpBtn.hidden = true;
     skeleton.hidden = false;
     slowNote.hidden = true;
     emptyState.hidden = true;
     syncRoomUI();
     renderCached();
     addNote('Комната: «' + label + '»');
-    closeLocalChannel();
-    if (state.mode === 'relay') {
-      connect();
-    } else {
-      hideBanner();
-      setConn('local');
-      openLocalChannel();
-      removeSkeleton();
-      maybeShowEmpty();
-    }
+    unsubscribeChannel();
+    if (state.joined) loadRoom();
   }
 
   function addNote(text) {
@@ -928,6 +832,7 @@
   }
   shareBtn.addEventListener('click', copyInvite);
   copyLinkBtn.addEventListener('click', copyInvite);
+  retryBtn.addEventListener('click', () => { hideBanner(); startAccess(); });
 
   // ── Кэш на старте ───────────────────────────────────────────
   function renderCached() {
@@ -959,30 +864,10 @@
     syncRoomUI();
     soundToggle.checked = state.sound;
 
-    const authed = safeGet(LS.auth) === '1';
-    if (!authed) {
-      document.documentElement.classList.add('no-auth');
-      document.documentElement.classList.remove('has-auth');
-      passGate.hidden = false;
-      nameGate.hidden = true;
-      setTimeout(() => passInput.focus(), 120);
-    } else {
-      document.documentElement.classList.add('has-auth');
-      document.documentElement.classList.remove('no-auth');
-      passGate.hidden = true;
-      if (state.name) {
-        applyName(state.name);
-        nameGate.hidden = true;
-      } else {
-        setTimeout(() => nameInput.focus(), 120);
-      }
-    }
-
+    if (state.name) document.documentElement.classList.add('has-name');
     renderCached();
     updateSendState();
-    if (authed) ensureTransport();
-
-    if (authed && state.name) setTimeout(() => composerInput.focus(), 160);
+    startAccess();
   }
 
   window.addEventListener('hashchange', () => {

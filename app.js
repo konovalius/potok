@@ -29,6 +29,7 @@
     room: DEFAULT_ROOM,
     seen: new Set(),        // id сообщений (строк базы), уже отрисованных
     pending: new Map(),     // client_msg_id -> { el, st, text, time, failed, reconciled }
+    msgEls: new Map(),      // id сообщения -> DOM-узел строки (для удаления)
     unread: 0,
     msgCount: 0,
     lastDay: '',
@@ -295,6 +296,7 @@
       if (!first) return;
       if (first.classList.contains('msg')) {
         if (first.classList.contains('msg-pending') || first.classList.contains('msg-error')) return; // не выкидываем «живые» сообщения
+        if (first.dataset.mid) state.msgEls.delete(first.dataset.mid);
         first.remove(); state.msgCount--;
       } else if (first.classList.contains('day') || first.classList.contains('note')) {
         first.remove();
@@ -305,7 +307,7 @@
   }
 
   function renderMessage(msg) {
-    const { name, text, time, mine } = msg;
+    const { name, text, time, mine, id } = msg;
     hideEmpty();
 
     const dk = dayKey(time);
@@ -355,6 +357,8 @@
     state.msgCount++;
     trimDom();
 
+    if (id != null && !msg.pending) attachMessageId(row, id);
+
     if (msg.pending || isNearBottom()) {
       requestAnimationFrame(() => scrollToBottom(msg.pending ? 'smooth' : 'auto'));
     }
@@ -373,6 +377,80 @@
       btn.addEventListener('click', () => retryMessage(p.id));
       p.st.appendChild(btn);
     }
+  }
+
+  // ── Удаление сообщений (строки удаляются из базы) ───────────
+  function attachMessageId(rowEl, id) {
+    if (!rowEl || id == null) return;
+    const key = String(id);
+    rowEl.dataset.mid = key;
+    state.msgEls.set(key, rowEl);
+    const wrap = rowEl.querySelector('.bubble-wrap');
+    if (wrap) addDeleteButton(wrap, key);
+  }
+
+  function addDeleteButton(wrapEl, id) {
+    if (!wrapEl || wrapEl.querySelector('.msg-del')) return;
+    const btn = el('button', 'msg-del', '×');
+    btn.type = 'button';
+    btn.setAttribute('aria-label', 'Удалить сообщение');
+    btn.title = 'Удалить';
+    let armed = false;
+    let timer = null;
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!armed) {
+        armed = true;
+        btn.classList.add('armed');
+        btn.textContent = 'Удалить?';
+        timer = setTimeout(() => {
+          armed = false;
+          btn.classList.remove('armed');
+          btn.textContent = '×';
+        }, 2800);
+        return;
+      }
+      clearTimeout(timer);
+      btn.disabled = true;
+      btn.textContent = '…';
+      deleteMessageById(id);
+    });
+    wrapEl.appendChild(btn);
+  }
+
+  async function deleteMessageById(id) {
+    if (!sb) return;
+    try {
+      const { error } = await sb.from('potok_messages').delete().eq('id', Number(id));
+      if (error) throw error;
+      removeMessageLocal(id);
+    } catch (e) {
+      toast('Не удалось удалить сообщение');
+      const node = state.msgEls.get(String(id));
+      const btn = node && node.querySelector('.msg-del');
+      if (btn) { btn.disabled = false; btn.classList.remove('armed'); btn.textContent = '×'; }
+    }
+  }
+
+  function removeMessageLocal(id) {
+    const key = String(id);
+    const node = state.msgEls.get(key);
+    if (node) {
+      state.msgEls.delete(key);
+      if (node.isConnected) { node.remove(); state.msgCount--; }
+    }
+    state.seen.delete(key);
+    removeFromCache(key);
+    if (state.msgCount <= 0) maybeShowEmpty();
+  }
+
+  function removeFromCache(id) {
+    try {
+      const arr = loadCache();
+      const filtered = arr.filter((m) => String(m.id) !== String(id));
+      if (filtered.length !== arr.length) safeSet(cacheKey(), JSON.stringify(filtered));
+    } catch (e) {}
   }
 
   // ── Доступ: сессия → членство → код ─────────────────────────
@@ -508,13 +586,14 @@
         p.el.classList.remove('msg-pending', 'msg-error');
         if (p.st && p.st.isConnected) p.st.remove();
       }
+      attachMessageId(p.el, id);
       addToCache({ id, n: row.author, t: Date.parse(row.created_at), x: row.body });
       return;
     }
     const name = (typeof row.author === 'string' && row.author.trim()) || 'Гость';
     const time = row.created_at ? Date.parse(row.created_at) : Date.now();
     const mine = name === state.name;
-    renderMessage({ name, text: row.body || '', time, mine, noAnim: !!quiet });
+    renderMessage({ name, text: row.body || '', time, mine, noAnim: !!quiet, id });
     state.seen.add(id);
     addToCache({ id, n: name, t: time, x: row.body || '' });
     if (quiet) return;
@@ -539,6 +618,11 @@
         const row = payload && payload.new;
         if (!row || row.room !== state.room) return;
         rowToMessage(row, false);
+      })
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'potok_messages' }, (payload) => {
+        const oldRow = payload && payload.old;
+        if (!oldRow || oldRow.id == null) return;
+        removeMessageLocal(String(oldRow.id));
       })
       .subscribe((status) => {
         if (status === 'SUBSCRIBED') { setConn('online'); hideBanner(); }
@@ -607,6 +691,7 @@
       } else {
         state.seen.add(id);
         if (p.el.isConnected) { p.el.classList.remove('msg-pending'); if (p.st && p.st.isConnected) p.st.remove(); }
+        attachMessageId(p.el, id);
         addToCache({ id, n: state.name, t: p.time, x: p.text });
       }
     } catch (err) {
@@ -853,7 +938,7 @@
     for (const it of items) {
       if (!it || !it.id || state.seen.has(it.id)) continue;
       state.seen.add(it.id);
-      renderMessage({ name: it.n || 'Гость', text: it.x || '', time: it.t || Date.now(), mine: (it.n || '') === state.name, noAnim: true });
+      renderMessage({ name: it.n || 'Гость', text: it.x || '', time: it.t || Date.now(), mine: (it.n || '') === state.name, noAnim: true, id: it.id });
       count++;
     }
     if (count) {

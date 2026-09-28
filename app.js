@@ -16,7 +16,8 @@
   const DOM_LIMIT = 300;
   const GROUP_WINDOW = 5 * 60 * 1000; // 5 минут — окно склейки сообщений одного автора
   const LIVE_WINDOW = 60 * 1000;      // старше минуты — считаем историей (без звука и счётчика)
-  const LS = { name: 'potok.v1.name', sound: 'potok.v1.sound', room: 'potok.v1.room' };
+  const LS = { name: 'potok.v1.name', sound: 'potok.v1.sound', room: 'potok.v1.room', auth: 'potok.v1.auth' };
+  const PASS_HASH = 'c6b36a3e88c6a6d89a766c3a0b269c344b8d1fe72cac8007029ce597b2674307'; // SHA-256 от "potok.v1|пароль"
 
   // ── Состояние ───────────────────────────────────────────────
   const state = {
@@ -40,6 +41,7 @@
   let failTimer = null;
   let audioCtx = null;
   let localCh = null;
+  let transportStarted = false;
 
   // ── Помощники ───────────────────────────────────────────────
   const $ = (id) => document.getElementById(id);
@@ -54,6 +56,11 @@
   const safeSet = (k, v) => { try { localStorage.setItem(k, v); } catch (e) { /* приватный режим — переживём */ } };
   const safeSGet = (k) => { try { return sessionStorage.getItem(k); } catch (e) { return null; } };
   const safeSSet = (k, v) => { try { sessionStorage.setItem(k, v); } catch (e) {} };
+
+  async function sha256Hex(text) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  }
 
   // Транслитерация для темы комнаты (в темах ntfy допустимы только [a-zA-Z0-9_-])
   const TRANSLIT = { а:'a',б:'b',в:'v',г:'g',д:'d',е:'e',ё:'e',ж:'zh',з:'z',и:'i',й:'y',к:'k',л:'l',м:'m',н:'n',о:'o',п:'p',р:'r',с:'s',т:'t',у:'u',ф:'f',х:'h',ц:'c',ч:'ch',ш:'sh',щ:'sch',ъ:'',ы:'y',ь:'',э:'e',ю:'yu',я:'ya' };
@@ -158,6 +165,10 @@
   const modeNoticeClose = $('modeNoticeClose');
   const legalLine = $('legalLine');
   const aboutHow = $('aboutHow');
+  const passGate = $('passGate');
+  const passForm = $('passForm');
+  const passInput = $('passInput');
+  const passError = $('passError');
 
   // ── Звук ────────────────────────────────────────────────────
   function ensureAudio() {
@@ -579,6 +590,10 @@
     }
   }
 
+  function ensureTransport() {
+    if (!transportStarted) { transportStarted = true; initTransport(); }
+  }
+
   function startLocalMode() {
     state.mode = 'local';
     clearTimers();
@@ -739,6 +754,39 @@
     nameGate.hidden = true;
     try { document.documentElement.classList.add('has-name'); } catch (e) {}
   }
+
+  function afterAuth() {
+    document.documentElement.classList.remove('no-auth');
+    document.documentElement.classList.add('has-auth');
+    passGate.hidden = true;
+    ensureTransport();
+    if (state.name) {
+      nameGate.hidden = true;
+    } else {
+      openGate();
+    }
+  }
+
+  passForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const v = passInput.value;
+    if (!v) { showFieldError(passInput, passError, 'Введите пароль.'); passInput.focus(); return; }
+    if (!window.crypto || !crypto.subtle) {
+      showFieldError(passInput, passError, 'Не удалось проверить пароль в этом браузере.');
+      return;
+    }
+    let ok = false;
+    try { ok = (await sha256Hex('potok.v1|' + v)) === PASS_HASH; } catch (err) { ok = false; }
+    if (!ok) {
+      showFieldError(passInput, passError, 'Неверный пароль — попробуйте ещё раз.');
+      passInput.select();
+      return;
+    }
+    clearFieldError(passInput, passError);
+    safeSet(LS.auth, '1');
+    afterAuth();
+  });
+  passInput.addEventListener('input', () => { if (!passError.hidden) clearFieldError(passInput, passError); });
 
   gateForm.addEventListener('submit', (e) => {
     e.preventDefault();
@@ -911,18 +959,30 @@
     syncRoomUI();
     soundToggle.checked = state.sound;
 
-    if (state.name) {
-      applyName(state.name);
+    const authed = safeGet(LS.auth) === '1';
+    if (!authed) {
+      document.documentElement.classList.add('no-auth');
+      document.documentElement.classList.remove('has-auth');
+      passGate.hidden = false;
       nameGate.hidden = true;
+      setTimeout(() => passInput.focus(), 120);
     } else {
-      setTimeout(() => nameInput.focus(), 120);
+      document.documentElement.classList.add('has-auth');
+      document.documentElement.classList.remove('no-auth');
+      passGate.hidden = true;
+      if (state.name) {
+        applyName(state.name);
+        nameGate.hidden = true;
+      } else {
+        setTimeout(() => nameInput.focus(), 120);
+      }
     }
 
     renderCached();
     updateSendState();
-    initTransport();
+    if (authed) ensureTransport();
 
-    if (state.name) setTimeout(() => composerInput.focus(), 160);
+    if (authed && state.name) setTimeout(() => composerInput.focus(), 160);
   }
 
   window.addEventListener('hashchange', () => {

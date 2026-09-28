@@ -17,8 +17,14 @@
     · транспорт: публичный релей ntfy.sh (JSON POST + SSE); если среда блокирует внешние соединения (CSP превью) — авто-переключение в локальный режим (BroadcastChannel между окнами).
 -->
 <script>
-  // До первой отрисовки: если имя уже сохранено, экран входа не показываем.
-  try { if (localStorage.getItem('potok.v1.name')) document.documentElement.classList.add('has-name'); } catch (e) {}
+  // До первой отрисовки: прячем ненужные экраны (если пароль / имя уже введены ранее).
+  try {
+    var a = localStorage.getItem('potok.v1.auth');
+    var n = localStorage.getItem('potok.v1.name');
+    var cl = document.documentElement.classList;
+    if (n) cl.add('has-name');
+    if (a === '1') cl.add('has-auth'); else cl.add('no-auth');
+  } catch (e) {}
 </script>
 <style>
   /* ─── tokens — шестёрка из сида web-prototype ────────────────────── */
@@ -327,6 +333,8 @@
   }
   .overlay[hidden] { display: none; }
   .has-name #nameGate { display: none !important; }
+  .no-auth #nameGate { display: none !important; }
+  .has-auth #passGate { display: none !important; }
   @keyframes fade-in { from { opacity: 0; } }
   .modal {
     width: min(450px, 100%); max-height: calc(100dvh - 40px); overflow-y: auto;
@@ -523,6 +531,29 @@
       <p class="legal" id="legalLine">Демо-сайт без сервера: сообщения передаются через публичный релей ntfy.sh, история хранится ≈12 часов. Не отправляйте личные данные.</p>
     </div>
   </footer>
+</div>
+
+<div class="overlay" id="passGate" role="dialog" aria-modal="true" aria-labelledby="passTitle">
+  <div class="modal">
+    <div class="modal-mark" aria-hidden="true">
+      <svg viewBox="0 0 32 32" width="46" height="46">
+        <rect width="32" height="32" rx="10" style="fill:var(--accent)"/>
+        <rect x="8" y="10" width="16" height="11" rx="3.5" style="fill:var(--surface)"/>
+        <path d="M11 21v4.5L16.5 21z" style="fill:var(--surface)"/>
+        <path d="M12 15.6c1.3-1.5 2.7-1.5 4 0s2.7 1.5 4 0" style="stroke:var(--accent);" stroke-width="1.7" fill="none" stroke-linecap="round"/>
+      </svg>
+    </div>
+    <h1 class="modal-title" id="passTitle">Вход по паролю</h1>
+    <p class="modal-sub">Это закрытый чат. Введите пароль доступа — он запрашивается один раз на устройстве.</p>
+    <form id="passForm" novalidate>
+      <label class="field">
+        <span class="field-label">Пароль</span>
+        <input class="input" id="passInput" name="password" type="password" maxlength="64" autocomplete="current-password" spellcheck="false" />
+        <span class="field-error" id="passError" role="alert" hidden></span>
+      </label>
+      <button class="btn btn-primary btn-block" type="submit">Войти</button>
+    </form>
+  </div>
 </div>
 
 <div class="overlay" id="nameGate" role="dialog" aria-modal="true" aria-labelledby="gateTitle">

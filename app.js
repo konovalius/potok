@@ -395,6 +395,14 @@
     if (anon.error) throw anon.error;
   }
 
+  let sessionPromise = null;
+  function ensureSessionOnce() {
+    if (!sessionPromise) {
+      sessionPromise = ensureSession().catch((e) => { sessionPromise = null; throw e; });
+    }
+    return sessionPromise;
+  }
+
   async function checkMember() {
     const r = await sb.rpc('potok_is_member');
     if (r.error) throw r.error;
@@ -417,7 +425,7 @@
     slowTimer = setTimeout(() => { if (!state.joined) slowNote.hidden = false; }, 9000);
     if (!sb) { clearTimeout(slowTimer); accessFail('Не удалось загрузить клиент базы — обновите страницу.'); return; }
     try {
-      await ensureSession();
+      await ensureSessionOnce();
     } catch (e) {
       clearTimeout(slowTimer);
       accessFail(blockedHintNeeded() ? BLOCKED_HINT : 'Нет связи с базой — проверьте интернет и нажмите «Переподключиться».');
@@ -465,6 +473,7 @@
     clearFieldError(passInput, passError);
     setGateBusy(true, 'Проверяем…');
     try {
+      await ensureSessionOnce(); // на случай, если сессия ещё не успела создаться
       const ok = await tryJoin(v);
       if (ok) {
         hideBanner();
@@ -475,7 +484,9 @@
         passInput.select();
       }
     } catch (err) {
-      showFieldError(passInput, passError, blockedHintNeeded() ? 'Площадка блокирует соединения — откройте рабочую версию.' : 'Нет связи с базой — проверьте интернет.');
+      showFieldError(passInput, passError, (err && err.code === '42501')
+        ? 'Секунду — сессия ещё создаётся. Попробуйте ещё раз.'
+        : (blockedHintNeeded() ? 'Площадка блокирует соединения — откройте рабочую версию.' : 'Нет связи с базой — проверьте интернет.'));
     } finally {
       setGateBusy(false);
     }

@@ -20,10 +20,7 @@
   // До первой отрисовки: прячем экран входа, если сессия уже есть (вернём из скрипта при необходимости).
   try {
     var s = localStorage.getItem('sb-bnlyvzmpumfjacnilykh-auth-token');
-    var n = localStorage.getItem('potok.v1.name');
-    var cl = document.documentElement.classList;
-    if (n) cl.add('has-name');
-    if (s) cl.add('has-session');
+    if (s) document.documentElement.classList.add('has-session');
   } catch (e) {}
 </script>
 <style>
@@ -337,7 +334,6 @@
     animation: fade-in 160ms ease;
   }
   .overlay[hidden] { display: none; }
-  .has-name #nameGate { display: none !important; }
   .has-session #passGate { display: none !important; }
   @keyframes fade-in { from { opacity: 0; } }
   .modal {
@@ -486,12 +482,6 @@
       <span id="offlineText"></span>
       <button class="btn-mini" id="retryBtn" type="button">Переподключиться</button>
     </div>
-    <div class="notice" id="modeNotice" hidden>
-      <span id="modeNoticeText">Локальный режим превью: сообщения синхронизируются между окнами этого браузера (внешние соединения здесь заблокированы). Общий чат между устройствами включится при размещении сайта на обычном хостинге.</span>
-      <button class="icon-btn" id="modeNoticeClose" type="button" aria-label="Скрыть уведомление" title="Скрыть">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
-      </button>
-    </div>
     <div class="chat-scroll" id="chatScroll" tabindex="-1">
       <div class="chat-inner">
         <div class="skeleton" id="skeleton" aria-hidden="true">
@@ -556,29 +546,6 @@
         <span class="field-error" id="passError" role="alert" hidden></span>
       </label>
       <button class="btn btn-primary btn-block" type="submit" id="passSubmit">Войти</button>
-    </form>
-  </div>
-</div>
-
-<div class="overlay" id="nameGate" role="dialog" aria-modal="true" aria-labelledby="gateTitle" hidden>
-  <div class="modal">
-    <div class="modal-mark" aria-hidden="true">
-      <svg viewBox="0 0 32 32" width="46" height="46">
-        <rect width="32" height="32" rx="10" style="fill:var(--accent)"/>
-        <rect x="8" y="10" width="16" height="11" rx="3.5" style="fill:var(--surface)"/>
-        <path d="M11 21v4.5L16.5 21z" style="fill:var(--surface)"/>
-        <path d="M12 15.6c1.3-1.5 2.7-1.5 4 0s2.7 1.5 4 0" style="stroke:var(--accent);" stroke-width="1.7" fill="none" stroke-linecap="round"/>
-      </svg>
-    </div>
-    <h1 class="modal-title" id="gateTitle">Как вас зовут?</h1>
-    <p class="modal-sub">Имя увидят все участники комнаты. Его можно сменить в любой момент — просто нажмите на кружок с именем в шапке.</p>
-    <form id="gateForm" novalidate>
-      <label class="field">
-        <span class="field-label">Ваше имя</span>
-        <input class="input" id="nameInput" name="name" maxlength="24" placeholder="Например, Никита" autocomplete="nickname" spellcheck="false" />
-        <span class="field-error" id="nameError" role="alert" hidden></span>
-      </label>
-      <button class="btn btn-primary btn-block" type="submit" id="gateSubmit">Войти в чат</button>
     </form>
   </div>
 </div>

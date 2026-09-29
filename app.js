@@ -36,6 +36,7 @@
     lastAuthor: '',
     lastTime: 0,
     joined: false,
+    dmPeer: null,
     baseTitle: 'Поток — общий чат'
   };
 
@@ -141,6 +142,8 @@
   const slowNote = $('slowNote');
   const emptyState = $('emptyState');
   const emptyCta = $('emptyCta');
+  const emptyTitle = $('emptyTitle');
+  const emptyTextEl = $('emptyText');
   const jumpBtn = $('jumpBtn');
   const jumpText = $('jumpText');
   const connBox = $('conn');
@@ -154,6 +157,8 @@
   const charCounter = $('charCounter');
   const roomChip = $('roomChip');
   const roomLabelEl = $('roomLabel');
+  const roomHashEl = $('roomHash');
+  const backBtn = $('backBtn');
   const shareBtn = $('shareBtn');
   const meBtn = $('meBtn');
   const meAvatar = $('meAvatar');
@@ -167,10 +172,10 @@
   const settingsForm = $('settingsForm');
   const settingsName = $('settingsName');
   const settingsNameError = $('settingsNameError');
-  const settingsRoom = $('settingsRoom');
   const soundToggle = $('soundToggle');
   const settingsClose = $('settingsClose');
   const copyLinkBtn = $('copyLinkBtn');
+  const logoutBtn = $('logoutBtn');
   const toasts = $('toasts');
 
   // ── Звук ────────────────────────────────────────────────────
@@ -200,13 +205,21 @@
   }
 
   // ── Тосты ───────────────────────────────────────────────────
-  function toast(text) {
-    const t = el('div', 'toast', text);
-    let hideTimer = setTimeout(hide, 3400);
+  function toast(text, onClick) {
+    const t = el('div', 'toast' + (onClick ? ' toast-click' : ''), text);
+    let hideTimer = setTimeout(hide, onClick ? 5200 : 3400);
     function hide() { t.classList.add('out'); setTimeout(() => t.remove(), 220); }
     t.addEventListener('mouseenter', () => clearTimeout(hideTimer));
     t.addEventListener('focusin', () => clearTimeout(hideTimer));
     t.addEventListener('mouseleave', () => { hideTimer = setTimeout(hide, 1200); });
+    if (onClick) {
+      t.addEventListener('click', () => { clearTimeout(hideTimer); t.remove(); onClick(); });
+      t.setAttribute('role', 'button');
+      t.tabIndex = 0;
+      t.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); clearTimeout(hideTimer); t.remove(); onClick(); }
+      });
+    }
     toasts.appendChild(t);
   }
 
@@ -320,7 +333,7 @@
   }
 
   function renderMessage(msg) {
-    const { name, text, time, mine, id } = msg;
+    const { name, text, time, mine, id, userId } = msg;
     hideEmpty();
 
     const dk = dayKey(time);
@@ -350,7 +363,15 @@
     const wrap = el('div', 'bubble-wrap');
     if (!grouped) {
       const head = el('div', 'msg-head');
-      head.appendChild(el('span', 'msg-name', name));
+      if (!mine && userId && currentUser && userId !== currentUser.id) {
+        const nameBtn = el('button', 'msg-name msg-name-btn', name);
+        nameBtn.type = 'button';
+        nameBtn.title = 'Написать личное сообщение';
+        nameBtn.addEventListener('click', () => openDM(userId, name));
+        head.appendChild(nameBtn);
+      } else {
+        head.appendChild(el('span', 'msg-name', name));
+      }
       head.appendChild(el('span', 'msg-time', timeFmt.format(new Date(time))));
       wrap.appendChild(head);
     }
@@ -606,7 +627,7 @@
     const name = (typeof row.author === 'string' && row.author.trim()) || 'Гость';
     const time = row.created_at ? Date.parse(row.created_at) : Date.now();
     const mine = isMine(row.user_id, name);
-    renderMessage({ name, text: row.body || '', time, mine, noAnim: !!quiet, id });
+    renderMessage({ name, text: row.body || '', time, mine, noAnim: !!quiet, id, userId: row.user_id || null });
     state.seen.add(id);
     addToCache({ id, n: name, t: time, x: row.body || '', u: row.user_id || null });
     if (quiet) return;
@@ -629,7 +650,15 @@
     channel
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'potok_messages' }, (payload) => {
         const row = payload && payload.new;
-        if (!row || row.room !== state.room) return;
+        if (!row) return;
+        if (row.room !== state.room) {
+          // личное сообщение, пришедшее, пока мы в другом чате
+          if (isDmForMe(row.room) && !isMine(row.user_id, row.author)) {
+            blip();
+            toast('Личное сообщение от «' + (((row.author || '').trim()) || 'Гость') + '»', () => openDM(row.user_id, row.author));
+          }
+          return;
+        }
         rowToMessage(row, false);
       })
       .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'potok_messages' }, (payload) => {
@@ -800,20 +829,19 @@
     meName.textContent = name;
     paintAvatar(meAvatar, name);
   }
-  function openSettings(focusRoom) {
+  function openSettings() {
     settingsName.value = state.name;
-    settingsRoom.value = state.room;
     soundToggle.checked = state.sound;
     clearFieldError(settingsName, settingsNameError);
     settings.hidden = false;
-    setTimeout(() => (focusRoom ? settingsRoom : settingsName).focus(), 80);
+    setTimeout(() => settingsName.focus(), 80);
   }
   function closeSettings() {
     settings.hidden = true;
     meBtn.focus();
   }
-  meBtn.addEventListener('click', () => openSettings(false));
-  roomChip.addEventListener('click', () => openSettings(true));
+  meBtn.addEventListener('click', () => openSettings());
+  backBtn.addEventListener('click', goGeneral);
   settingsClose.addEventListener('click', closeSettings);
   settings.addEventListener('click', (e) => { if (e.target === settings) closeSettings(); });
 
@@ -824,10 +852,7 @@
     if (err) { showFieldError(settingsName, settingsNameError, err); settingsName.focus(); return; }
     clearFieldError(settingsName, settingsNameError);
 
-    const newRoom = normalizeRoom(settingsRoom.value);
     const nameChanged = v !== state.name;
-    const roomChanged = newRoom !== state.room;
-
     if (nameChanged) {
       applyName(v);
       addNote('Теперь вы пишете как «' + v + '»');
@@ -837,8 +862,7 @@
     if (state.sound) ensureAudio();
 
     closeSettings();
-    if (roomChanged) switchRoom(newRoom);
-    else toast('Сохранено');
+    toast('Сохранено');
   });
   settingsName.addEventListener('input', () => {
     if (!settingsNameError.hidden) {
@@ -854,17 +878,35 @@
     if (e.key === 'Escape' && !settings.hidden) closeSettings();
   });
 
-  // ── Комнаты ─────────────────────────────────────────────────
+  // ── Чаты: общий и личные ───────────────────────────────────
+  function dmKeyFor(otherId) {
+    const a = (currentUser && currentUser.id) || '';
+    const b = String(otherId);
+    const pair = [a, b].sort();
+    return 'dm:' + pair[0] + ':' + pair[1];
+  }
+  function isDmForMe(roomKey) {
+    if (!roomKey || roomKey.indexOf('dm:') !== 0 || !currentUser) return false;
+    const parts = roomKey.split(':');
+    return parts[1] === currentUser.id || parts[2] === currentUser.id;
+  }
+
   function syncRoomUI() {
-    roomLabelEl.textContent = state.room;
-    composerInput.placeholder = 'Сообщение в #' + state.room;
-    state.baseTitle = state.room === DEFAULT_ROOM ? 'Поток — общий чат' : 'Поток — комната «' + state.room + '»';
+    const inDm = !!state.dmPeer;
+    roomHashEl.textContent = inDm ? '@' : '#';
+    roomLabelEl.textContent = inDm ? state.dmPeer.name : DEFAULT_ROOM;
+    backBtn.hidden = !inDm;
+    composerInput.placeholder = inDm ? ('Личное сообщение для «' + state.dmPeer.name + '»') : ('Сообщение в #' + DEFAULT_ROOM);
+    state.baseTitle = inDm ? ('Поток — личный чат с «' + state.dmPeer.name + '»') : 'Поток — общий чат';
+    emptyTitle.textContent = inDm ? 'Личный чат' : 'Здесь пока тихо';
+    emptyTextEl.textContent = inDm
+      ? ('Сообщения здесь видят только вы и «' + state.dmPeer.name + '».')
+      : 'Напишите первое сообщение — его увидят все, кто в общем чате. Сообщения появляются сверху вниз, у всех сразу.';
     updateUnreadUI();
   }
-  function switchRoom(label) {
-    state.room = label;
-    safeSet(LS.room, label);
-    try { history.replaceState(null, '', '#' + encodeURIComponent(label)); } catch (e) {}
+
+  function switchRoom(roomKey) {
+    state.room = roomKey;
     chatList.textContent = '';
     state.seen.clear();
     state.pending.clear();
@@ -879,9 +921,21 @@
     emptyState.hidden = true;
     syncRoomUI();
     renderCached();
-    addNote('Комната: «' + label + '»');
+    addNote(state.dmPeer ? ('Личный чат с «' + state.dmPeer.name + '»') : 'Общий чат');
     unsubscribeChannel();
     if (state.joined) loadRoom();
+  }
+
+  function openDM(peerId, peerName) {
+    if (!state.joined || !currentUser || !peerId || peerId === currentUser.id) return;
+    state.dmPeer = { id: String(peerId), name: ((peerName || '').trim() || 'Гость') };
+    switchRoom(dmKeyFor(peerId));
+  }
+
+  function goGeneral() {
+    if (!state.dmPeer && state.room === DEFAULT_ROOM) return;
+    state.dmPeer = null;
+    switchRoom(DEFAULT_ROOM);
   }
 
   function addNote(text) {
@@ -891,12 +945,11 @@
 
   // ── Приглашение ─────────────────────────────────────────────
   async function copyInvite() {
-    const base = location.href.split('#')[0];
-    const url = base + '#' + encodeURIComponent(state.room);
+    const url = location.href.split('#')[0];
     let ok = false;
     try { await navigator.clipboard.writeText(url); ok = true; }
     catch (e) { ok = fallbackCopy(url); }
-    toast(ok ? 'Ссылка-приглашение скопирована' : 'Скопируйте адрес из строки браузера');
+    toast(ok ? 'Ссылка на чат скопирована' : 'Скопируйте адрес из строки браузера');
   }
   function fallbackCopy(text) {
     const ta = el('textarea');
@@ -914,6 +967,36 @@
   copyLinkBtn.addEventListener('click', copyInvite);
   retryBtn.addEventListener('click', () => { hideBanner(); startAccess(); });
 
+  // Выход из приложения: закрываем сессию и возвращаемся к экрану кода
+  let logoutArmed = false;
+  let logoutTimer = null;
+  logoutBtn.addEventListener('click', async () => {
+    if (!logoutArmed) {
+      logoutArmed = true;
+      logoutBtn.classList.add('armed');
+      logoutBtn.textContent = 'Точно выйти?';
+      logoutTimer = setTimeout(() => {
+        logoutArmed = false;
+        logoutBtn.classList.remove('armed');
+        logoutBtn.textContent = 'Выйти';
+      }, 3000);
+      return;
+    }
+    clearTimeout(logoutTimer);
+    logoutBtn.disabled = true;
+    logoutBtn.textContent = 'Выходим…';
+    try { if (sb) await sb.auth.signOut(); } catch (e) {}
+    try {
+      const drop = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.indexOf(CACHE_PREFIX) === 0) drop.push(k);
+      }
+      for (const k of drop) localStorage.removeItem(k);
+    } catch (e) {}
+    location.reload();
+  });
+
   // ── Кэш на старте ───────────────────────────────────────────
   function renderCached() {
     const items = loadCache();
@@ -923,7 +1006,7 @@
       if (!it || !it.id || state.seen.has(it.id)) continue;
       state.seen.add(it.id);
       const cachedMine = isMine(it.u || null, it.n || '');
-      renderMessage({ name: it.n || 'Гость', text: it.x || '', time: it.t || Date.now(), mine: cachedMine, noAnim: true, id: it.id });
+      renderMessage({ name: it.n || 'Гость', text: it.x || '', time: it.t || Date.now(), mine: cachedMine, noAnim: true, id: it.id, userId: it.u || null });
       count++;
     }
     if (count) {
@@ -936,11 +1019,7 @@
   function boot() {
     state.name = (safeSGet('potok.v1.name_tab') || safeGet(LS.name) || '').trim();
     state.sound = safeGet(LS.sound) !== '0';
-
-    let room = '';
-    try { room = decodeURIComponent(location.hash.slice(1)).trim(); } catch (e) { room = ''; }
-    state.room = normalizeRoom(room || safeGet(LS.room) || DEFAULT_ROOM);
-    safeSet(LS.room, state.room);
+    state.room = DEFAULT_ROOM;
 
     syncRoomUI();
     soundToggle.checked = state.sound;
@@ -949,13 +1028,6 @@
     updateSendState();
     startAccess();
   }
-
-  window.addEventListener('hashchange', () => {
-    let r = '';
-    try { r = decodeURIComponent(location.hash.slice(1)).trim(); } catch (e) { r = ''; }
-    const nr = normalizeRoom(r || DEFAULT_ROOM);
-    if (nr !== state.room) switchRoom(nr);
-  });
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot);

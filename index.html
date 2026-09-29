@@ -14,7 +14,8 @@
     · направление: Minimal / Editorial — тёплая бумага, терракотовый акцент, serif-брендинг (сид web-prototype);
     · used_skill: web-prototype; used_design_system: null — у сида собственный стиль, дизайн-система по правилам роутера не подключается;
     · craft: typography / color / anti-ai-slop / accessibility-baseline / state-coverage / laws-of-ux / form-validation / animation-discipline;
-    · транспорт: приватная база Supabase (анонимная сессия → серверная проверка кода доступа → защита на уровне строк); публичных каналов нет.
+    · транспорт: приватная база Supabase (анонимная сессия → серверная проверка кода доступа → защита на уровне строк); публичных каналов нет;
+    · шифрование: AES-GCM, ключ выводится из кода (PBKDF2); база хранит только шифротекст.
 -->
 <script>
   // До первой отрисовки: прячем экран входа, если сессия уже есть (вернём из скрипта при необходимости).
@@ -233,6 +234,7 @@
     word-break: break-all;
   }
   .bubble a:hover { text-decoration-color: var(--accent); }
+  .bubble.locked { color: var(--muted); font-style: italic; }
 
   .msg-pending .bubble { opacity: 0.72; }
   .msg-error .bubble { border-color: var(--accent); }
@@ -524,7 +526,7 @@
   <footer class="composer-bar" data-od-id="composer">
     <div class="composer-inner">
       <form class="composer" id="composerForm" autocomplete="off">
-        <textarea class="composer-input" id="composerInput" rows="1" maxlength="1200" placeholder="Сообщение в #общий" aria-label="Текст сообщения"></textarea>
+        <textarea class="composer-input" id="composerInput" rows="1" maxlength="600" placeholder="Сообщение в #общий" aria-label="Текст сообщения"></textarea>
         <button class="send-btn" id="sendBtn" type="submit" aria-label="Отправить сообщение" title="Отправить" disabled>
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
         </button>
@@ -533,7 +535,7 @@
         <span class="hint">Enter — отправить · Shift+Enter — новая строка</span>
         <span class="counter" id="charCounter" hidden></span>
       </div>
-      <p class="legal" id="legalLine">Закрытый чат: сообщения хранятся в приватной базе и видны только участникам.</p>
+      <p class="legal" id="legalLine">Сквозное шифрование: сообщения шифруются на ваших устройствах; в базе хранится только шифротекст.</p>
     </div>
   </footer>
 </div>
@@ -549,7 +551,7 @@
       </svg>
     </div>
     <h1 class="modal-title" id="passTitle">Вход</h1>
-    <p class="modal-sub">Это закрытый чат: доступ только у своих. Введите код доступа — он спрашивается один раз на устройстве.</p>
+    <p class="modal-sub">Это закрытый чат со сквозным шифрованием. Код спрашивается один раз на устройстве и служит ключом к сообщениям.</p>
     <form id="passForm" novalidate>
       <label class="field">
         <span class="field-label">Код доступа</span>
@@ -587,7 +589,7 @@
       </div>
     </form>
     <div class="modal-foot">
-      <span id="aboutHow">Как это работает: общий чат видят все участники, личные переписки — только вы и собеседник. Сообщения хранятся в приватной базе; история постоянная.</span>
+      <span id="aboutHow">Как это работает: код доступа превращается в ключ шифрования; сообщения шифруются на устройствах, и сервер видит только шифротекст. Личные переписки доступны только двоим.</span>
     </div>
   </div>
 </div>

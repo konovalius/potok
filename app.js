@@ -1,7 +1,8 @@
 /*
   «Поток» — закрытый общий чат. Логика клиента.
   Транспорт: приватная база Supabase (анонимная сессия + код доступа + защита на уровне строк).
-  Без серверного кода: сайт статический; доступ и хранение обеспечивает база.
+  Сквозное шифрование: сообщения шифруются на устройстве (AES-GCM; ключ выводится из кода доступа) —
+  база хранит только шифротекст.
 */
 (() => {
   'use strict';
@@ -13,13 +14,16 @@
     : null;
 
   const DEFAULT_ROOM = 'общий';
-  const MAX_TEXT = 2000;
+  const MAX_TEXT = 600;         // с шифрованием сообщение занимает больше места в базе
+  const E2E_PREFIX = 'e2e1:';   // метка шифрованного сообщения
+  const E2E_SALT = 'potok.e2e.v1';
+  const E2E_ITER = 210000;
   const CACHE_LIMIT = 80;
   const DOM_LIMIT = 300;
   const HISTORY_LIMIT = 300;
   const GROUP_WINDOW = 5 * 60 * 1000; // 5 минут — окно склейки сообщений одного автора
   const LIVE_WINDOW = 60 * 1000;      // старше минуты — считаем историей (без звука и счётчика)
-  const LS = { name: 'potok.v1.name', sound: 'potok.v1.sound', room: 'potok.v1.room' };
+  const LS = { name: 'potok.v1.name', sound: 'potok.v1.sound', room: 'potok.v1.room', key: 'potok.v3.key' };
   const CACHE_PREFIX = 'potok.v2.cache.';
 
   // ── Состояние ───────────────────────────────────────────────
@@ -42,6 +46,7 @@
 
   let channel = null;        // realtime-канал текущей комнаты
   let currentUser = null;    // текущий пользователь сессии (для «моё/не моё»)
+  let cryptoKey = null;      // ключ шифрования (CryptoKey), выведен из кода доступа
   let loadTimer = null;
   let slowTimer = null;
   let audioCtx = null;
@@ -93,6 +98,65 @@
   function isMine(userId, name) {
     if (userId && currentUser && currentUser.id) return userId === currentUser.id;
     return (name || '') === state.name;
+  }
+
+  // ── Сквозное шифрование (E2E) ───────────────────────────────
+  function bufToB64(buf) {
+    const b = new Uint8Array(buf);
+    let s = '';
+    for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    return btoa(s);
+  }
+  function b64ToBuf(b64) {
+    const s = atob(b64);
+    const b = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
+    return b;
+  }
+  async function deriveKeyBits(code) {
+    const enc = new TextEncoder();
+    const base = await crypto.subtle.importKey('raw', enc.encode(code), 'PBKDF2', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: enc.encode(E2E_SALT), iterations: E2E_ITER, hash: 'SHA-256' }, base, 256);
+    return new Uint8Array(bits);
+  }
+  async function importCryptoKey(bits) {
+    return crypto.subtle.importKey('raw', bits, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+  }
+  async function setUpKey(code) {
+    const bits = await deriveKeyBits(code);
+    cryptoKey = await importCryptoKey(bits);
+    safeSet(LS.key, bufToB64(bits));
+  }
+  async function loadStoredKey() {
+    if (cryptoKey) return true;
+    const stored = safeGet(LS.key);
+    if (!stored) return false;
+    try { cryptoKey = await importCryptoKey(b64ToBuf(stored)); return true; }
+    catch (e) { cryptoKey = null; return false; }
+  }
+  async function encryptPayload(obj) {
+    if (!cryptoKey) throw new Error('no-key');
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, cryptoKey, new TextEncoder().encode(JSON.stringify(obj)));
+    const out = new Uint8Array(iv.length + ct.byteLength);
+    out.set(iv, 0);
+    out.set(new Uint8Array(ct), iv.length);
+    return E2E_PREFIX + bufToB64(out);
+  }
+  async function decryptPayload(body) {
+    const src = String(body || '');
+    if (src.indexOf(E2E_PREFIX) !== 0) return { t: src, n: null, plain: true, failed: false };
+    try {
+      if (!cryptoKey) throw new Error('no-key');
+      const buf = b64ToBuf(src.slice(E2E_PREFIX.length));
+      const iv = buf.slice(0, 12);
+      const ct = buf.slice(12);
+      const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, cryptoKey, ct);
+      const obj = JSON.parse(new TextDecoder().decode(pt));
+      return { t: String(obj.t || ''), n: String(obj.n || ''), plain: false, failed: false };
+    } catch (e) {
+      return { t: 'Сообщение зашифровано — нет ключа или повреждено', n: '', plain: false, failed: true };
+    }
   }
 
   // Идентичность: цвет аватара выводится из имени — одинаков у всех участников
@@ -375,7 +439,7 @@
       head.appendChild(el('span', 'msg-time', timeFmt.format(new Date(time))));
       wrap.appendChild(head);
     }
-    const bubble = el('div', 'bubble');
+    const bubble = el('div', 'bubble' + (msg.locked ? ' locked' : ''));
     linkifyInto(bubble, String(text));
     wrap.appendChild(bubble);
 
@@ -548,7 +612,9 @@
     try { member = await checkMember(); } catch (e) { member = false; }
     clearTimeout(slowTimer);
     if (member) {
-      enterChat();
+      const keyOk = await loadStoredKey();
+      if (keyOk) enterChat();
+      else showPassGate();
     } else {
       showPassGate();
     }
@@ -589,6 +655,7 @@
       const ok = await tryJoin(v);
       if (ok) {
         hideBanner();
+        try { await setUpKey(v); } catch (e) { toast('Не удалось включить шифрование — проверьте браузер.'); }
         document.documentElement.classList.add('has-session');
         enterChat();
       } else {
@@ -606,12 +673,12 @@
   passInput.addEventListener('input', () => { if (!passError.hidden) clearFieldError(passInput, passError); });
 
   // ── Комнаты: загрузка из базы и realtime ────────────────────
-  function rowToMessage(row, quiet) {
+  async function rowToMessage(row, quiet) {
     const id = String(row.id);
     if (state.seen.has(id)) return;
     const cmid = row.client_msg_id;
     if (cmid && state.pending.has(cmid)) {
-      // эхо собственного сообщения — финализируем оптимистичный пузырь
+      // эхо собственного сообщения — финализируем оптимистичный пузырь (текст уже есть)
       const p = state.pending.get(cmid);
       p.reconciled = true;
       state.pending.delete(cmid);
@@ -621,18 +688,19 @@
         if (p.st && p.st.isConnected) p.st.remove();
       }
       attachMessageId(p.el, id);
-      addToCache({ id, n: row.author, t: Date.parse(row.created_at), x: row.body, u: row.user_id || null });
+      addToCache({ id, n: state.name, t: p.time, x: p.text, u: row.user_id || (currentUser && currentUser.id) || null });
       return;
     }
-    const name = (typeof row.author === 'string' && row.author.trim()) || 'Гость';
     const time = row.created_at ? Date.parse(row.created_at) : Date.now();
+    const dec = await decryptPayload(row.body || '');
+    const name = dec.plain ? (((typeof row.author === 'string' && row.author.trim()) || 'Гость')) : (dec.n || '·');
     const mine = isMine(row.user_id, name);
-    renderMessage({ name, text: row.body || '', time, mine, noAnim: !!quiet, id, userId: row.user_id || null });
+    renderMessage({ name, text: dec.t, time, mine, noAnim: !!quiet, id, userId: row.user_id || null, locked: dec.failed });
     state.seen.add(id);
-    addToCache({ id, n: name, t: time, x: row.body || '', u: row.user_id || null });
+    addToCache({ id, n: name, t: time, x: dec.t, u: row.user_id || null });
     if (quiet) return;
     const age = Date.now() - time;
-    if (!mine && age < LIVE_WINDOW) {
+    if (!mine && !dec.failed && age < LIVE_WINDOW) {
       blip();
       if (document.hidden || !isNearBottom()) state.unread++;
       updateUnreadUI();
@@ -648,18 +716,20 @@
     if (!sb || !state.joined) return;
     channel = sb.channel('potok-' + slugifyRoom(state.room));
     channel
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'potok_messages' }, (payload) => {
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'potok_messages' }, async (payload) => {
         const row = payload && payload.new;
         if (!row) return;
         if (row.room !== state.room) {
           // личное сообщение, пришедшее, пока мы в другом чате
-          if (isDmForMe(row.room) && !isMine(row.user_id, row.author)) {
+          const dec = await decryptPayload(row.body || '');
+          const nm = dec.plain ? (((row.author || '').trim()) || 'Гость') : (dec.n || 'Гость');
+          if (isDmForMe(row.room) && !isMine(row.user_id, nm)) {
             blip();
-            toast('Личное сообщение от «' + (((row.author || '').trim()) || 'Гость') + '»', () => openDM(row.user_id, row.author));
+            toast('Личное сообщение от «' + nm + '»', () => openDM(row.user_id, nm));
           }
           return;
         }
-        rowToMessage(row, false);
+        await rowToMessage(row, false);
       })
       .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'potok_messages' }, (payload) => {
         const oldRow = payload && payload.old;
@@ -689,7 +759,7 @@
       let count = 0;
       for (const row of rows) {
         const before = state.msgCount;
-        rowToMessage(row, true);
+        await rowToMessage(row, true);
         if (state.msgCount > before) count++;
       }
       removeSkeleton();
@@ -711,10 +781,19 @@
   async function publish(cmid) {
     const p = state.pending.get(cmid);
     if (!p) return;
+    if (!cryptoKey) {
+      p.failed = true;
+      if (p.el.isConnected) { p.el.classList.add('msg-error'); p.el.classList.remove('msg-pending'); }
+      setStatusNode(p, 'failed');
+      toast('Нет ключа шифрования — войдите по коду заново.');
+      showPassGate();
+      return;
+    }
     try {
+      const encBody = await encryptPayload({ t: p.text, n: state.name });
       const { data, error } = await sb
         .from('potok_messages')
-        .insert({ room: state.room, author: state.name, body: p.text, client_msg_id: cmid })
+        .insert({ room: state.room, author: '•', body: encBody, client_msg_id: cmid })
         .select('id, author, created_at, client_msg_id')
         .single();
       if (error) {
@@ -775,10 +854,10 @@
   function updateCounter() {
     const len = composerInput.value.length;
     const left = MAX_TEXT - len;
-    if (left <= 220) {
+    if (left <= 120) {
       charCounter.hidden = false;
       charCounter.textContent = 'осталось ' + Math.max(left, 0);
-      charCounter.classList.toggle('warn', left <= 80);
+      charCounter.classList.toggle('warn', left <= 40);
     } else {
       charCounter.hidden = true;
       charCounter.classList.remove('warn');
@@ -990,9 +1069,10 @@
       const drop = [];
       for (let i = 0; i < localStorage.length; i++) {
         const k = localStorage.key(i);
-        if (k && k.indexOf(CACHE_PREFIX) === 0) drop.push(k);
+        if (k && (k.indexOf(CACHE_PREFIX) === 0 || k === LS.key)) drop.push(k);
       }
       for (const k of drop) localStorage.removeItem(k);
+      cryptoKey = null;
     } catch (e) {}
     location.reload();
   });

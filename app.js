@@ -641,6 +641,7 @@
     }
     if (state.msgCount === 0) maybeShowEmpty();
     loadRoom();
+    initWall();
     setTimeout(() => composerInput.focus(), 120);
   }
 
@@ -1021,6 +1022,467 @@
     const n = el('div', 'note', text);
     chatList.appendChild(n);
   }
+
+  // ── Стена: общий холст для рисования ───────────────────────
+  const WALL_ROOM = 'wall';
+  const WALL_FONTS = {
+    sans: "'Segoe UI', system-ui, sans-serif",
+    hand: "'Segoe Script', 'Comic Sans MS', cursive",
+    poster: "Impact, 'Arial Black', sans-serif",
+    mono: "'Courier New', monospace",
+    serif: "Georgia, 'Times New Roman', serif"
+  };
+  const WALL_COLORS = { ink: '#1a1916', terra: '#c96442', blue: '#3b6ea5', green: '#4a8c5c', yellow: '#e0a63a', pink: '#c65b8a' };
+  const wallState = {
+    ready: false,
+    loaded: false,
+    strokes: [],
+    byId: new Map(),
+    byDb: new Map(),
+    live: new Map(),
+    drawing: null,
+    tool: 'brush',
+    color: '#1a1916',
+    size: 6,
+    collapsed: false,
+    renderScheduled: false
+  };
+  let wallChannel = null;
+  let wallLastSend = 0;
+  let wallPendingPts = [];
+  let wallClearArmed = false;
+  let wallClearTimer = null;
+
+  const wallEl = $('wall');
+  const wallCanvas = $('wallCanvas');
+  const wallPreview = $('wallPreview');
+  const wallToggleBtn = $('wallToggle');
+  const wallUndoBtn = $('wallUndo');
+  const wallSaveBtn = $('wallSave');
+  const wallClearBtn = $('wallClear');
+  const wallToolsEl = $('wallTools');
+  const wallColorsEl = $('wallColors');
+  const wallSizesEl = $('wallSizes');
+  const wallCustom = $('wallCustom');
+  const wallTextRow = $('wallTextRow');
+  const wallTextInput = $('wallTextInput');
+  const wallFontSel = $('wallFont');
+  const wallCtx = wallCanvas ? wallCanvas.getContext('2d') : null;
+  const wallPreviewCtx = wallPreview ? wallPreview.getContext('2d') : null;
+
+  function sidSeed(sid) {
+    let h = 0;
+    for (let i = 0; i < sid.length; i++) h = (h * 31 + sid.charCodeAt(i)) | 0;
+    return h;
+  }
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function drawWallStroke(ctx, s, w, h) {
+    if (!s || !ctx) return;
+    const lw = Math.max((s.w || 0.006) * w, 0.6);
+    const erase = s.m === 'erase';
+    ctx.save();
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = s.c || '#1a1916';
+    ctx.fillStyle = s.c || '#1a1916';
+    ctx.lineWidth = lw;
+    if (erase) ctx.globalCompositeOperation = 'destination-out';
+    else if (s.t === 'marker') ctx.globalAlpha = 0.45;
+    if (s.t === 'brush' || s.t === 'marker' || s.t === 'eraser') {
+      const pts = s.pts || [];
+      if (!pts.length) { ctx.restore(); return; }
+      if (pts.length === 1) {
+        ctx.beginPath();
+        ctx.arc(pts[0][0] * w, pts[0][1] * h, lw / 2, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.beginPath();
+        ctx.moveTo(pts[0][0] * w, pts[0][1] * h);
+        for (let i = 1; i < pts.length - 1; i++) {
+          const xc = (pts[i][0] + pts[i + 1][0]) / 2 * w;
+          const yc = (pts[i][1] + pts[i + 1][1]) / 2 * h;
+          ctx.quadraticCurveTo(pts[i][0] * w, pts[i][1] * h, xc, yc);
+        }
+        ctx.lineTo(pts[pts.length - 1][0] * w, pts[pts.length - 1][1] * h);
+        ctx.stroke();
+      }
+    } else if (s.t === 'spray') {
+      const pts = s.pts || [];
+      const rad = Math.max(lw * 2.4, 7);
+      for (let i = 0; i < pts.length; i++) {
+        const idx = (s.__idx != null ? s.__idx : 0) + i;
+        const rnd = mulberry32((sidSeed(s.s) ^ Math.imul(idx + 1, 0x9E3779B1)) | 0);
+        const x = pts[i][0] * w;
+        const y = pts[i][1] * h;
+        for (let k = 0; k < 10; k++) {
+          const ang = rnd() * Math.PI * 2;
+          const rr = rnd() * rad;
+          const d = 0.9 + rnd() * 1.3;
+          ctx.globalAlpha = 0.05 + rnd() * 0.08;
+          ctx.beginPath();
+          ctx.arc(x + Math.cos(ang) * rr, y + Math.sin(ang) * rr, d, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+      ctx.globalAlpha = 1;
+    } else if (s.t === 'line' && s.p1 && s.p2) {
+      ctx.beginPath();
+      ctx.moveTo(s.p1[0] * w, s.p1[1] * h);
+      ctx.lineTo(s.p2[0] * w, s.p2[1] * h);
+      ctx.stroke();
+    } else if (s.t === 'rect' && s.p1 && s.p2) {
+      ctx.strokeRect(Math.min(s.p1[0], s.p2[0]) * w, Math.min(s.p1[1], s.p2[1]) * h, Math.abs(s.p2[0] - s.p1[0]) * w, Math.abs(s.p2[1] - s.p1[1]) * h);
+    } else if (s.t === 'ellipse' && s.p1 && s.p2) {
+      ctx.beginPath();
+      ctx.ellipse(((s.p1[0] + s.p2[0]) / 2) * w, ((s.p1[1] + s.p2[1]) / 2) * h, Math.abs(s.p2[0] - s.p1[0]) / 2 * w, Math.abs(s.p2[1] - s.p1[1]) / 2 * h, 0, 0, Math.PI * 2);
+      ctx.stroke();
+    } else if (s.t === 'text' && s.p && s.tx) {
+      ctx.font = Math.max((s.w || 0.02) * w, 10) + 'px ' + (WALL_FONTS[s.f] || WALL_FONTS.sans);
+      ctx.textBaseline = 'top';
+      ctx.fillText(String(s.tx).slice(0, 40), s.p[0] * w, s.p[1] * h);
+    }
+    ctx.restore();
+  }
+
+  function wallFullRender() {
+    if (!wallCanvas || !wallCtx) return;
+    const w = wallCanvas.clientWidth;
+    const h = wallCanvas.clientHeight;
+    if (!w || !h) return;
+    const dpr = window.devicePixelRatio || 1;
+    if (wallCanvas.width !== Math.round(w * dpr)) { wallCanvas.width = Math.round(w * dpr); wallCanvas.height = Math.round(h * dpr); }
+    if (wallPreview.width !== wallCanvas.width) { wallPreview.width = wallCanvas.width; wallPreview.height = wallCanvas.height; }
+    wallCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    wallCtx.clearRect(0, 0, w, h);
+    const ordered = wallState.strokes.slice().sort((a, b) => (a.tm - b.tm) || 0);
+    for (const s of ordered) drawWallStroke(wallCtx, s, w, h);
+    for (const s of wallState.live.values()) drawWallStroke(wallCtx, s, w, h);
+    if (wallState.drawing) drawWallStroke(wallCtx, wallState.drawing, w, h);
+  }
+  function scheduleWallRender() {
+    if (wallState.renderScheduled) return;
+    wallState.renderScheduled = true;
+    requestAnimationFrame(() => { wallState.renderScheduled = false; wallFullRender(); });
+  }
+  function wallPreviewClear() {
+    if (!wallPreview || !wallPreviewCtx) return;
+    wallPreviewCtx.clearRect(0, 0, wallPreview.clientWidth, wallPreview.clientHeight);
+  }
+
+  function wallPos(e) {
+    const r = wallCanvas.getBoundingClientRect();
+    return [Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)), Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))];
+  }
+
+  function wallBroadcastChunk(s, pts, first) {
+    if (!wallChannel) return;
+    const obj = first ? { s: s.s, t: s.t, c: s.c, w: s.w, m: s.m, a: pts } : { s: s.s, a: pts };
+    encryptPayload(obj).then((enc) => {
+      try { wallChannel.send({ type: 'broadcast', event: 'draw', payload: { e: enc } }); } catch (e) {}
+    }).catch(() => {});
+  }
+
+  function wallPointerDown(e) {
+    if (!wallState.ready || !state.joined || !cryptoKey) return;
+    if (e.isPrimary === false) return;
+    e.preventDefault();
+    const tool = wallState.tool;
+    const [x, y] = wallPos(e);
+    if (tool === 'text') {
+      const tx = (wallTextInput.value || '').trim();
+      if (!tx) { toast('Введите текст для надписи'); wallTextInput.focus(); return; }
+      commitWallStroke({ t: 'text', c: wallState.color, w: wallState.size / Math.max(wallCanvas.clientWidth, 1), p: [x, y], tx, f: wallFontSel.value || 'sans' });
+      return;
+    }
+    try { wallCanvas.setPointerCapture(e.pointerId); } catch (err) {}
+    const base = {
+      s: (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 's' + Date.now() + Math.random().toString(16).slice(2),
+      t: tool,
+      c: wallState.color,
+      w: wallState.size / Math.max(wallCanvas.clientWidth, 1)
+    };
+    if (tool === 'brush' || tool === 'marker' || tool === 'spray' || tool === 'eraser') {
+      base.m = tool === 'eraser' ? 'erase' : 'ink';
+      base.pts = [[x, y]];
+      wallState.drawing = base;
+      wallPendingPts = [[x, y]];
+      wallBroadcastChunk(base, [[x, y]], true);
+      drawWallStroke(wallCtx, base, wallCanvas.clientWidth, wallCanvas.clientHeight);
+    } else {
+      base.p1 = [x, y];
+      base.p2 = [x, y];
+      wallState.drawing = base;
+      wallPreviewClear();
+      drawWallStroke(wallPreviewCtx, base, wallPreview.clientWidth, wallPreview.clientHeight);
+    }
+  }
+
+  function wallPointerMove(e) {
+    const s = wallState.drawing;
+    if (!s) return;
+    if (e.isPrimary === false) return;
+    const [x, y] = wallPos(e);
+    if (s.pts) {
+      const last = s.pts[s.pts.length - 1];
+      if (Math.abs(x - last[0]) < 0.0018 && Math.abs(y - last[1]) < 0.0018) return;
+      s.pts.push([x, y]);
+      wallPendingPts.push([x, y]);
+      if (s.t === 'spray') {
+        drawWallStroke(wallCtx, { s: s.s, t: 'spray', c: s.c, w: s.w, m: s.m, pts: [[x, y]], __idx: s.pts.length - 1 }, wallCanvas.clientWidth, wallCanvas.clientHeight);
+      } else {
+        drawWallStroke(wallCtx, { s: s.s, t: s.t, c: s.c, w: s.w, m: s.m, pts: [last, [x, y]] }, wallCanvas.clientWidth, wallCanvas.clientHeight);
+      }
+      const now = Date.now();
+      if (now - wallLastSend > 45 && wallPendingPts.length) {
+        wallLastSend = now;
+        const chunk = wallPendingPts;
+        wallPendingPts = [];
+        wallBroadcastChunk(s, chunk, false);
+      }
+    } else {
+      s.p2 = [x, y];
+      wallPreviewClear();
+      drawWallStroke(wallPreviewCtx, s, wallPreview.clientWidth, wallPreview.clientHeight);
+    }
+  }
+
+  function wallPointerUp() {
+    const s = wallState.drawing;
+    if (!s) return;
+    wallState.drawing = null;
+    wallPreviewClear();
+    if (s.pts) {
+      if (wallPendingPts.length) { wallBroadcastChunk(s, wallPendingPts, false); wallPendingPts = []; }
+      if (s.pts.length < 2) s.pts.push([s.pts[0][0] + 0.0006, s.pts[0][1] + 0.0006]);
+    }
+    commitWallStroke(s);
+  }
+
+  function commitWallStroke(s) {
+    s.tm = Date.now();
+    s.uid = (currentUser && currentUser.id) || null;
+    wallState.strokes.push(s);
+    wallState.byId.set(s.s, s);
+    scheduleWallRender();
+    persistWallStroke(s);
+  }
+
+  async function persistWallStroke(s) {
+    try {
+      const payload = await encryptPayload({ s: s.s, t: s.t, c: s.c, w: s.w, m: s.m, pts: s.pts, p1: s.p1, p2: s.p2, p: s.p, tx: s.tx, f: s.f });
+      const { data, error } = await sb.from('potok_strokes').insert({ room: WALL_ROOM, payload }).select('id, created_at').single();
+      if (error) throw error;
+      s.dbId = data.id;
+      wallState.byDb.set(String(data.id), s.s);
+      if (data.created_at) s.tm = Date.parse(data.created_at);
+    } catch (err) {
+      toast('Штрих не сохранился — пропадёт после перезагрузки');
+    }
+  }
+
+  function removeWallStroke(dbId) {
+    const sid = wallState.byDb.get(String(dbId));
+    if (!sid) return;
+    wallState.byDb.delete(String(dbId));
+    wallState.byId.delete(sid);
+    const i = wallState.strokes.findIndex((x) => x.s === sid);
+    if (i >= 0) wallState.strokes.splice(i, 1);
+    wallState.live.delete(sid);
+    scheduleWallRender();
+  }
+
+  async function loadWallStrokes() {
+    if (!sb || wallState.loaded) return;
+    try {
+      const { data, error } = await sb.from('potok_strokes')
+        .select('id, room, payload, user_id, created_at')
+        .eq('room', WALL_ROOM)
+        .order('created_at', { ascending: true })
+        .limit(2000);
+      if (error) throw error;
+      for (const row of (data || [])) {
+        const dec = await decryptPayload(row.payload || '');
+        if (dec.failed || dec.plain) continue;
+        let st = null;
+        try { st = JSON.parse(dec.t); } catch (e) { continue; }
+        if (!st || !st.s || wallState.byId.has(st.s)) continue;
+        st.tm = row.created_at ? Date.parse(row.created_at) : Date.now();
+        st.dbId = row.id;
+        st.uid = row.user_id || null;
+        wallState.strokes.push(st);
+        wallState.byId.set(st.s, st);
+        wallState.byDb.set(String(row.id), st.s);
+      }
+      wallState.loaded = true;
+      scheduleWallRender();
+    } catch (e) { /* стена догрузится позже */ }
+  }
+
+  function initWall() {
+    if (!wallEl || !wallCanvas) return;
+    if (wallState.ready) { scheduleWallRender(); return; }
+    wallState.ready = true;
+    scheduleWallRender();
+    loadWallStrokes();
+    if (!sb || !state.joined) return;
+    try {
+      wallChannel = sb.channel('potok-wall', { config: { broadcast: { self: false } } });
+      wallChannel
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'potok_strokes' }, async (payload) => {
+          const row = payload && payload.new;
+          if (!row || row.room !== WALL_ROOM) return;
+          const dec = await decryptPayload(row.payload || '');
+          if (dec.failed || dec.plain) return;
+          let st = null;
+          try { st = JSON.parse(dec.t); } catch (e) { return; }
+          if (!st || !st.s) return;
+          const ex = wallState.byId.get(st.s);
+          if (ex) {
+            ex.dbId = row.id;
+            wallState.byDb.set(String(row.id), st.s);
+            if (ex.partial) {
+              Object.assign(ex, st, { partial: false, dbId: row.id });
+              if (row.created_at) ex.tm = Date.parse(row.created_at);
+              scheduleWallRender();
+            }
+            return;
+          }
+          st.tm = row.created_at ? Date.parse(row.created_at) : Date.now();
+          st.dbId = row.id;
+          st.uid = row.user_id || null;
+          wallState.strokes.push(st);
+          wallState.byId.set(st.s, st);
+          wallState.byDb.set(String(row.id), st.s);
+          wallState.live.delete(st.s);
+          scheduleWallRender();
+        })
+        .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'potok_strokes' }, (payload) => {
+          const oldRow = payload && payload.old;
+          if (!oldRow || oldRow.id == null) return;
+          removeWallStroke(String(oldRow.id));
+        })
+        .on('broadcast', { event: 'draw' }, async (msg) => {
+          const enc = msg && msg.payload && msg.payload.e;
+          if (!enc) return;
+          const dec = await decryptPayload(enc);
+          if (dec.failed || dec.plain) return;
+          let chunk = null;
+          try { chunk = JSON.parse(dec.t); } catch (e) { return; }
+          if (!chunk || !chunk.s || wallState.byId.has(chunk.s)) return;
+          let live = wallState.live.get(chunk.s);
+          if (!live) {
+            live = { s: chunk.s, t: chunk.t || 'brush', c: chunk.c || '#1a1916', w: chunk.w || 0.008, m: chunk.m || 'ink', pts: [], partial: true, tm: Date.now() };
+            wallState.live.set(chunk.s, live);
+          }
+          if (Array.isArray(chunk.a) && chunk.a.length) live.pts = live.pts.concat(chunk.a);
+          scheduleWallRender();
+        })
+        .subscribe(() => {});
+    } catch (e) { wallChannel = null; }
+  }
+
+  function setWallTool(tool) {
+    wallState.tool = tool;
+    wallToolsEl.querySelectorAll('.wbtn').forEach((b) => b.classList.toggle('active', b.dataset.tool === tool));
+    wallTextRow.hidden = tool !== 'text';
+    if (tool === 'text') wallTextInput.focus();
+  }
+  function setWallColorKey(key, raw) {
+    wallState.color = raw || WALL_COLORS[key] || '#1a1916';
+    wallColorsEl.querySelectorAll('.wswatch').forEach((b) => b.classList.toggle('active', b.dataset.c === key));
+  }
+
+  wallToolsEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('.wbtn');
+    if (btn && btn.dataset.tool) setWallTool(btn.dataset.tool);
+  });
+  wallColorsEl.addEventListener('click', (e) => {
+    const b = e.target.closest('.wswatch');
+    if (b) setWallColorKey(b.dataset.c);
+  });
+  wallCustom.addEventListener('input', () => {
+    setWallColorKey(null, wallCustom.value);
+    wallColorsEl.querySelectorAll('.wswatch').forEach((x) => x.classList.remove('active'));
+  });
+  wallSizesEl.addEventListener('click', (e) => {
+    const b = e.target.closest('.wsize');
+    if (!b) return;
+    wallState.size = Number(b.dataset.size) || 6;
+    wallSizesEl.querySelectorAll('.wsize').forEach((x) => x.classList.toggle('active', x === b));
+  });
+  wallToggleBtn.addEventListener('click', () => {
+    wallState.collapsed = !wallState.collapsed;
+    wallEl.classList.toggle('collapsed', wallState.collapsed);
+    setTimeout(scheduleWallRender, 220);
+  });
+  wallUndoBtn.addEventListener('click', async () => {
+    const mine = wallState.strokes.slice().reverse().find((s) => s.uid && currentUser && s.uid === currentUser.id);
+    if (!mine) { toast('Нет ваших штрихов для отмены'); return; }
+    if (!mine.dbId) { toast('Секунду — штрих ещё сохраняется'); return; }
+    try {
+      const { error } = await sb.from('potok_strokes').delete().eq('id', mine.dbId);
+      if (error) throw error;
+      removeWallStroke(String(mine.dbId));
+    } catch (e) { toast('Не удалось отменить штрих'); }
+  });
+  wallSaveBtn.addEventListener('click', () => {
+    try {
+      const w = wallCanvas.clientWidth;
+      const h = wallCanvas.clientHeight;
+      const dpr = window.devicePixelRatio || 1;
+      const off = document.createElement('canvas');
+      off.width = w * dpr;
+      off.height = h * dpr;
+      const octx = off.getContext('2d');
+      octx.scale(dpr, dpr);
+      octx.fillStyle = '#fdfcfa';
+      octx.fillRect(0, 0, w, h);
+      const ordered = wallState.strokes.slice().sort((a, b) => (a.tm - b.tm) || 0);
+      for (const s of ordered) drawWallStroke(octx, s, w, h);
+      const a = document.createElement('a');
+      a.download = 'potok-wall.png';
+      a.href = off.toDataURL('image/png');
+      a.click();
+    } catch (e) { toast('Не удалось сохранить рисунок'); }
+  });
+  wallClearBtn.addEventListener('click', async () => {
+    if (!wallClearArmed) {
+      wallClearArmed = true;
+      wallClearBtn.classList.add('armed');
+      wallClearTimer = setTimeout(() => { wallClearArmed = false; wallClearBtn.classList.remove('armed'); }, 3000);
+      return;
+    }
+    clearTimeout(wallClearTimer);
+    wallClearArmed = false;
+    wallClearBtn.classList.remove('armed');
+    try {
+      const { error } = await sb.from('potok_strokes').delete().eq('room', WALL_ROOM);
+      if (error) throw error;
+      wallState.strokes = [];
+      wallState.byId.clear();
+      wallState.byDb.clear();
+      wallState.live.clear();
+      scheduleWallRender();
+    } catch (e) { toast('Не удалось очистить стену'); }
+  });
+  wallCanvas.addEventListener('pointerdown', wallPointerDown);
+  wallCanvas.addEventListener('pointermove', wallPointerMove);
+  wallCanvas.addEventListener('pointerup', wallPointerUp);
+  wallCanvas.addEventListener('pointercancel', wallPointerUp);
+  window.addEventListener('resize', () => scheduleWallRender());
+  setWallTool('brush');
+  wallColorsEl.querySelectorAll('.wswatch').forEach((b) => { b.style.background = WALL_COLORS[b.dataset.c] || '#1a1916'; });
+  setWallColorKey('ink');
+  wallCustom.value = WALL_COLORS.terra;
+  wallSizesEl.querySelectorAll('.wsize').forEach((x) => x.classList.toggle('active', Number(x.dataset.size) === wallState.size));
 
   // ── Приглашение ─────────────────────────────────────────────
   async function copyInvite() {

@@ -451,6 +451,13 @@
   #wallPreview { z-index: 2; pointer-events: none; }
   #wallToggle svg { transition: transform 150ms ease; }
   .wall.collapsed #wallToggle svg { transform: rotate(180deg); }
+  #wallToggle { width: auto; padding: 0 9px; gap: 5px; display: flex; align-items: center; }
+  .wtoggle-text { display: none; font-size: 12.5px; white-space: nowrap; }
+  .wall.collapsed .wtoggle-text { display: inline; }
+  .wall-collapsed-note { font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+  .wall.collapsed .wall-bar { flex-wrap: nowrap; padding-bottom: 0; }
+  .wall.collapsed .wall-inner { justify-content: center; padding-top: 6px; padding-bottom: 6px; }
+  .wall.collapsed .wall-bar > *:not(.wall-spacer):not(#wallToggle):not(.wall-collapsed-note) { display: none; }
 
   /* ─── адаптив ───────────────────────────────────────────────────── */
   @media (max-width: 640px) {
@@ -532,6 +539,7 @@
     <div class="wall-inner">
       <div class="wall-bar">
         <span class="wall-title">Стена</span>
+        <span class="wall-collapsed-note" id="wallCollapsedNote" hidden>Стена свёрнута</span>
         <div class="wgroup" id="wallTools" role="group" aria-label="Инструменты">
           <button class="wbtn" data-tool="brush" type="button" title="Кисть" aria-label="Кисть"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9.1 11.9l8.1-8.1a2.8 2.8 0 0 1 4 4l-8.1 8.1"/><path d="M7.1 14.9a3 3 0 0 0-3 3c0 1.3-2.5 1.5-2 2 1.1 1.1 2.5 2 4 2a4 4 0 0 0 4-4 3 3 0 0 0-3-3z"/></svg></button>
           <button class="wbtn" data-tool="marker" type="button" title="Маркер" aria-label="Маркер"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.8 2.8 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg></button>
@@ -561,11 +569,18 @@
           <button class="wsize" data-size="6" type="button" title="Средне"><span style="width:8px;height:8px"></span></button>
           <button class="wsize" data-size="12" type="button" title="Толсто"><span style="width:12px;height:12px"></span></button>
         </div>
+        <span class="wsep" aria-hidden="true"></span>
+        <div class="wgroup" id="wallOpacity" role="group" aria-label="Прозрачность линий">
+          <button class="wsize wop" data-o="1" type="button" title="Без прозрачности" aria-label="Непрозрачность 100%"><span style="width:12px;height:12px;opacity:1"></span></button>
+          <button class="wsize wop" data-o="0.75" type="button" title="Прозрачность 25%" aria-label="Непрозрачность 75%"><span style="width:12px;height:12px;opacity:0.72"></span></button>
+          <button class="wsize wop" data-o="0.5" type="button" title="Прозрачность 50%" aria-label="Непрозрачность 50%"><span style="width:12px;height:12px;opacity:0.45"></span></button>
+          <button class="wsize wop" data-o="0.25" type="button" title="Прозрачность 75%" aria-label="Непрозрачность 25%"><span style="width:12px;height:12px;opacity:0.22"></span></button>
+        </div>
         <span class="wall-spacer"></span>
         <button class="wbtn" id="wallUndo" type="button" title="Отменить свой штрих" aria-label="Отменить свой штрих"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6.7 3L3 13"/></svg></button>
         <button class="wbtn" id="wallSave" type="button" title="Скачать рисунок" aria-label="Скачать рисунок"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg></button>
         <button class="wbtn" id="wallClear" type="button" title="Очистить стену" aria-label="Очистить стену"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>
-        <button class="wbtn" id="wallToggle" type="button" title="Свернуть или развернуть стену" aria-label="Свернуть стену"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></button>
+        <button class="wbtn" id="wallToggle" type="button" title="Свернуть стену" aria-label="Свернуть стену"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="m6 15 6-6 6 6"/></svg><span class="wtoggle-text">Развернуть</span></button>
       </div>
       <div class="wall-textrow" id="wallTextRow" hidden>
         <input class="input wall-textinput" id="wallTextInput" maxlength="40" placeholder="Надпись для стены" />
@@ -690,8 +705,8 @@
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
-<script src="config.js?v=2"></script>
-<script src="supabase-js.js?v=2"></script>
-<script src="app.js?v=2"></script>
+<script src="config.js?v=3"></script>
+<script src="supabase-js.js?v=3"></script>
+<script src="app.js?v=3"></script>
 </body>
 </html>

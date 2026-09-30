@@ -1359,18 +1359,18 @@
         .gt('created_at', sinceIso)
         .order('created_at', { ascending: true })
         .limit(100);
-      if (error) return;
+      if (error) { wallState.pollErr = String(error.message || 'poll-error'); return; }
       let changed = false;
       for (const row of (data || [])) { if (await ingestWallRow(row)) changed = true; }
       if (changed) scheduleWallRender();
-    } catch (e) {}
+    } catch (e) { wallState.pollErr = String((e && e.message) || 'poll-exc'); }
   }
 
   async function pollWallReconcile() {
     if (!sb || !state.joined || !wallState.ready) return;
     try {
       const { data, error } = await sb.from('potok_strokes').select('id').eq('room', WALL_ROOM).limit(2000);
-      if (error || !Array.isArray(data)) return;
+      if (error || !Array.isArray(data)) { if (error) wallState.pollErr = 'reconcile: ' + String(error.message || ''); return; }
       const ids = new Set(data.map((r) => String(r.id)));
       let changed = false;
       for (const s of wallState.strokes.slice()) {
@@ -1531,6 +1531,18 @@
   setWallColorKey('ink');
   wallCustom.value = WALL_COLORS.terra;
   wallSizesEl.querySelectorAll('.wsize').forEach((x) => x.classList.toggle('active', Number(x.dataset.size) === wallState.size));
+  window.__wallDbg = () => ({
+    ready: wallState.ready,
+    loaded: wallState.loaded,
+    strokes: wallState.strokes.length,
+    byId: wallState.byId.size,
+    byDb: wallState.byDb.size,
+    lastTs: wallLastTs,
+    ticks: wallPollTicks,
+    pollErr: wallState.pollErr || '',
+    hasKey: !!cryptoKey,
+    joined: state.joined
+  });
 
   // ── Приглашение ─────────────────────────────────────────────
   async function copyInvite() {

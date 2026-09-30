@@ -1044,6 +1044,7 @@
     tool: 'brush',
     color: '#1a1916',
     size: 6,
+    opacity: 1,
     collapsed: false,
     renderScheduled: false
   };
@@ -1063,6 +1064,8 @@
   const wallToolsEl = $('wallTools');
   const wallColorsEl = $('wallColors');
   const wallSizesEl = $('wallSizes');
+  const wallOpacityEl = $('wallOpacity');
+  const wallCollapsedNote = $('wallCollapsedNote');
   const wallCustom = $('wallCustom');
   const wallTextRow = $('wallTextRow');
   const wallTextInput = $('wallTextInput');
@@ -1094,8 +1097,9 @@
     ctx.strokeStyle = s.c || '#1a1916';
     ctx.fillStyle = s.c || '#1a1916';
     ctx.lineWidth = lw;
+    const baseAlpha = (s.o != null && s.o !== '') ? Math.min(1, Math.max(0.05, Number(s.o) || 1)) : 1;
     if (erase) ctx.globalCompositeOperation = 'destination-out';
-    else if (s.t === 'marker') ctx.globalAlpha = 0.45;
+    else ctx.globalAlpha = baseAlpha;
     if (s.t === 'brush' || s.t === 'marker' || s.t === 'eraser') {
       const pts = s.pts || [];
       if (!pts.length) { ctx.restore(); return; }
@@ -1126,7 +1130,7 @@
           const ang = rnd() * Math.PI * 2;
           const rr = rnd() * rad;
           const d = 0.9 + rnd() * 1.3;
-          ctx.globalAlpha = 0.05 + rnd() * 0.08;
+          ctx.globalAlpha = (0.05 + rnd() * 0.08) * baseAlpha;
           ctx.beginPath();
           ctx.arc(x + Math.cos(ang) * rr, y + Math.sin(ang) * rr, d, 0, Math.PI * 2);
           ctx.fill();
@@ -1161,6 +1165,7 @@
     if (wallCanvas.width !== Math.round(w * dpr)) { wallCanvas.width = Math.round(w * dpr); wallCanvas.height = Math.round(h * dpr); }
     if (wallPreview.width !== wallCanvas.width) { wallPreview.width = wallCanvas.width; wallPreview.height = wallCanvas.height; }
     wallCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (wallPreviewCtx) wallPreviewCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
     wallCtx.clearRect(0, 0, w, h);
     const ordered = wallState.strokes.slice().sort((a, b) => (a.tm - b.tm) || 0);
     for (const s of ordered) drawWallStroke(wallCtx, s, w, h);
@@ -1174,7 +1179,10 @@
   }
   function wallPreviewClear() {
     if (!wallPreview || !wallPreviewCtx) return;
-    wallPreviewCtx.clearRect(0, 0, wallPreview.clientWidth, wallPreview.clientHeight);
+    wallPreviewCtx.save();
+    wallPreviewCtx.setTransform(1, 0, 0, 1, 0, 0);
+    wallPreviewCtx.clearRect(0, 0, wallPreview.width, wallPreview.height);
+    wallPreviewCtx.restore();
   }
 
   function wallPos(e) {
@@ -1184,7 +1192,7 @@
 
   function wallBroadcastChunk(s, pts, first) {
     if (!wallChannel) return;
-    const obj = first ? { s: s.s, t: s.t, c: s.c, w: s.w, m: s.m, a: pts } : { s: s.s, a: pts };
+    const obj = first ? { s: s.s, t: s.t, c: s.c, w: s.w, m: s.m, o: s.o, a: pts } : { s: s.s, a: pts };
     encryptPayload(obj).then((enc) => {
       try { wallChannel.send({ type: 'broadcast', event: 'draw', payload: { e: enc } }); } catch (e) {}
     }).catch(() => {});
@@ -1199,7 +1207,7 @@
     if (tool === 'text') {
       const tx = (wallTextInput.value || '').trim();
       if (!tx) { toast('Введите текст для надписи'); wallTextInput.focus(); return; }
-      commitWallStroke({ t: 'text', c: wallState.color, w: wallState.size / Math.max(wallCanvas.clientWidth, 1), p: [x, y], tx, f: wallFontSel.value || 'sans' });
+      commitWallStroke({ t: 'text', c: wallState.color, o: wallState.opacity, w: wallState.size / Math.max(wallCanvas.clientWidth, 1), p: [x, y], tx, f: wallFontSel.value || 'sans' });
       return;
     }
     try { wallCanvas.setPointerCapture(e.pointerId); } catch (err) {}
@@ -1207,6 +1215,7 @@
       s: (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 's' + Date.now() + Math.random().toString(16).slice(2),
       t: tool,
       c: wallState.color,
+      o: wallState.opacity,
       w: wallState.size / Math.max(wallCanvas.clientWidth, 1)
     };
     if (tool === 'brush' || tool === 'marker' || tool === 'spray' || tool === 'eraser') {
@@ -1236,9 +1245,9 @@
       s.pts.push([x, y]);
       wallPendingPts.push([x, y]);
       if (s.t === 'spray') {
-        drawWallStroke(wallCtx, { s: s.s, t: 'spray', c: s.c, w: s.w, m: s.m, pts: [[x, y]], __idx: s.pts.length - 1 }, wallCanvas.clientWidth, wallCanvas.clientHeight);
+        drawWallStroke(wallCtx, { s: s.s, t: 'spray', c: s.c, w: s.w, m: s.m, o: s.o, pts: [[x, y]], __idx: s.pts.length - 1 }, wallCanvas.clientWidth, wallCanvas.clientHeight);
       } else {
-        drawWallStroke(wallCtx, { s: s.s, t: s.t, c: s.c, w: s.w, m: s.m, pts: [last, [x, y]] }, wallCanvas.clientWidth, wallCanvas.clientHeight);
+        drawWallStroke(wallCtx, { s: s.s, t: s.t, c: s.c, w: s.w, m: s.m, o: s.o, pts: [last, [x, y]] }, wallCanvas.clientWidth, wallCanvas.clientHeight);
       }
       const now = Date.now();
       if (now - wallLastSend > 45 && wallPendingPts.length) {
@@ -1277,7 +1286,7 @@
 
   async function persistWallStroke(s) {
     try {
-      const payload = await encryptPayload({ s: s.s, t: s.t, c: s.c, w: s.w, m: s.m, pts: s.pts, p1: s.p1, p2: s.p2, p: s.p, tx: s.tx, f: s.f });
+      const payload = await encryptPayload({ s: s.s, t: s.t, c: s.c, w: s.w, m: s.m, o: s.o, pts: s.pts, p1: s.p1, p2: s.p2, p: s.p, tx: s.tx, f: s.f });
       const { data, error } = await sb.from('potok_strokes').insert({ room: WALL_ROOM, payload }).select('id, created_at').single();
       if (error) throw error;
       s.dbId = data.id;
@@ -1440,7 +1449,7 @@
           if (!chunk || !chunk.s || wallState.byId.has(chunk.s)) return;
           let live = wallState.live.get(chunk.s);
           if (!live) {
-            live = { s: chunk.s, t: chunk.t || 'brush', c: chunk.c || '#1a1916', w: chunk.w || 0.008, m: chunk.m || 'ink', pts: [], partial: true, tm: Date.now() };
+            live = { s: chunk.s, t: chunk.t || 'brush', c: chunk.c || '#1a1916', w: chunk.w || 0.008, m: chunk.m || 'ink', o: chunk.o, pts: [], partial: true, tm: Date.now() };
             wallState.live.set(chunk.s, live);
           }
           if (Array.isArray(chunk.a) && chunk.a.length) live.pts = live.pts.concat(chunk.a);
@@ -1459,6 +1468,10 @@
   function setWallColorKey(key, raw) {
     wallState.color = raw || WALL_COLORS[key] || '#1a1916';
     wallColorsEl.querySelectorAll('.wswatch').forEach((b) => b.classList.toggle('active', b.dataset.c === key));
+  }
+  function setWallOpacity(v) {
+    wallState.opacity = v;
+    wallOpacityEl.querySelectorAll('.wop').forEach((b) => b.classList.toggle('active', Number(b.dataset.o) === v));
   }
 
   wallToolsEl.addEventListener('click', (e) => {
@@ -1479,9 +1492,18 @@
     wallState.size = Number(b.dataset.size) || 6;
     wallSizesEl.querySelectorAll('.wsize').forEach((x) => x.classList.toggle('active', x === b));
   });
+  wallOpacityEl.addEventListener('click', (e) => {
+    const b = e.target.closest('.wop');
+    if (!b) return;
+    setWallOpacity(Number(b.dataset.o) || 1);
+  });
   wallToggleBtn.addEventListener('click', () => {
     wallState.collapsed = !wallState.collapsed;
     wallEl.classList.toggle('collapsed', wallState.collapsed);
+    if (wallCollapsedNote) wallCollapsedNote.hidden = !wallState.collapsed;
+    const label = wallState.collapsed ? 'Развернуть стену' : 'Свернуть стену';
+    wallToggleBtn.title = label;
+    wallToggleBtn.setAttribute('aria-label', label);
     setTimeout(scheduleWallRender, 220);
   });
   wallUndoBtn.addEventListener('click', async () => {
@@ -1542,11 +1564,14 @@
   setWallTool('brush');
   wallColorsEl.querySelectorAll('.wswatch').forEach((b) => { b.style.background = WALL_COLORS[b.dataset.c] || '#1a1916'; });
   setWallColorKey('ink');
+  setWallOpacity(1);
   wallCustom.value = WALL_COLORS.terra;
   wallSizesEl.querySelectorAll('.wsize').forEach((x) => x.classList.toggle('active', Number(x.dataset.size) === wallState.size));
   window.__wallDbg = () => ({
     ready: wallState.ready,
     loaded: wallState.loaded,
+    opacity: wallState.opacity,
+    collapsed: wallState.collapsed,
     strokes: wallState.strokes.length,
     byId: wallState.byId.size,
     byDb: wallState.byDb.size,

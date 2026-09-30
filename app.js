@@ -1280,7 +1280,7 @@
     wallState.strokes.push(s);
     wallState.byId.set(s.s, s);
     scheduleWallRender();
-    setTimeout(scheduleWallRender, 450);
+    wallPollFastUntil = Date.now() + 8000;
     persistWallStroke(s);
   }
 
@@ -1311,6 +1311,7 @@
   let wallLastTs = 0;
   let wallPollTimer = null;
   let wallPollTicks = 0;
+  let wallPollFastUntil = 0;
 
   async function ingestWallRow(row) {
     if (!row || !row.id) return false;
@@ -1380,7 +1381,7 @@
       if (error) { wallState.pollErr = String(error.message || 'poll-error'); return; }
       let changed = false;
       for (const row of (data || [])) { if (await ingestWallRow(row)) changed = true; }
-      if (changed) scheduleWallRender();
+      if (changed) { wallPollFastUntil = Date.now() + 8000; scheduleWallRender(); }
     } catch (e) { wallState.pollErr = String((e && e.message) || 'poll-exc'); }
   }
 
@@ -1400,7 +1401,7 @@
           changed = true;
         }
       }
-      if (changed) scheduleWallRender();
+      if (changed) { wallPollFastUntil = Date.now() + 8000; scheduleWallRender(); }
     } catch (e) {}
   }
 
@@ -1412,10 +1413,11 @@
       wallPollTicks = tick;
       await pollWallAdds();
       if (tick % 5 === 0) await pollWallReconcile();
-      wallPollTimer = setTimeout(loop, 6000);
+      const fast = Date.now() < wallPollFastUntil;
+      wallPollTimer = setTimeout(loop, fast ? 2500 : 6000);
     };
-    wallPollTimer = setTimeout(loop, 5000);
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) pollWallAdds(); });
+    wallPollTimer = setTimeout(loop, 3000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) { wallPollFastUntil = Date.now() + 6000; pollWallAdds(); } });
   }
 
   function initWall() {
@@ -1453,6 +1455,7 @@
             wallState.live.set(chunk.s, live);
           }
           if (Array.isArray(chunk.a) && chunk.a.length) live.pts = live.pts.concat(chunk.a);
+          wallPollFastUntil = Date.now() + 5000;
           scheduleWallRender();
         })
         .subscribe(() => {});

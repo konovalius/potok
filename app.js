@@ -1299,6 +1299,41 @@
     scheduleWallRender();
   }
 
+  let wallLastTs = 0;
+  let wallPollTimer = null;
+  let wallPollTicks = 0;
+
+  async function ingestWallRow(row) {
+    if (!row || !row.id) return false;
+    const key = String(row.id);
+    if (row.created_at) { const t = Date.parse(row.created_at); if (t > wallLastTs) wallLastTs = t; }
+    if (wallState.byDb.has(key)) return false;
+    const dec = await decryptPayload(row.payload || '');
+    if (dec.failed || dec.plain) return false;
+    let st = null;
+    try { st = JSON.parse(dec.t); } catch (e) { return false; }
+    if (!st || !st.s) return false;
+    const ex = wallState.byId.get(st.s);
+    if (ex) {
+      ex.dbId = row.id;
+      wallState.byDb.set(key, st.s);
+      if (ex.partial) {
+        Object.assign(ex, st, { partial: false, dbId: row.id });
+        if (row.created_at) ex.tm = Date.parse(row.created_at);
+        return true;
+      }
+      return false;
+    }
+    st.tm = row.created_at ? Date.parse(row.created_at) : Date.now();
+    st.dbId = row.id;
+    st.uid = row.user_id || null;
+    wallState.strokes.push(st);
+    wallState.byId.set(st.s, st);
+    wallState.byDb.set(key, st.s);
+    wallState.live.delete(st.s);
+    return true;
+  }
+
   async function loadWallStrokes() {
     if (!sb || wallState.loaded) return;
     try {
@@ -1308,22 +1343,57 @@
         .order('created_at', { ascending: true })
         .limit(2000);
       if (error) throw error;
-      for (const row of (data || [])) {
-        const dec = await decryptPayload(row.payload || '');
-        if (dec.failed || dec.plain) continue;
-        let st = null;
-        try { st = JSON.parse(dec.t); } catch (e) { continue; }
-        if (!st || !st.s || wallState.byId.has(st.s)) continue;
-        st.tm = row.created_at ? Date.parse(row.created_at) : Date.now();
-        st.dbId = row.id;
-        st.uid = row.user_id || null;
-        wallState.strokes.push(st);
-        wallState.byId.set(st.s, st);
-        wallState.byDb.set(String(row.id), st.s);
-      }
+      for (const row of (data || [])) { await ingestWallRow(row); }
       wallState.loaded = true;
       scheduleWallRender();
     } catch (e) { /* стена догрузится позже */ }
+  }
+
+  async function pollWallAdds() {
+    if (!sb || !state.joined || !wallState.ready) return;
+    try {
+      const sinceIso = new Date(Math.max(wallLastTs - 1000, 0)).toISOString();
+      const { data, error } = await sb.from('potok_strokes')
+        .select('id, room, payload, user_id, created_at')
+        .eq('room', WALL_ROOM)
+        .gt('created_at', sinceIso)
+        .order('created_at', { ascending: true })
+        .limit(100);
+      if (error) return;
+      let changed = false;
+      for (const row of (data || [])) { if (await ingestWallRow(row)) changed = true; }
+      if (changed) scheduleWallRender();
+    } catch (e) {}
+  }
+
+  async function pollWallReconcile() {
+    if (!sb || !state.joined || !wallState.ready) return;
+    try {
+      const { data, error } = await sb.from('potok_strokes').select('id').eq('room', WALL_ROOM).limit(2000);
+      if (error || !Array.isArray(data)) return;
+      const ids = new Set(data.map((r) => String(r.id)));
+      let changed = false;
+      for (const s of wallState.strokes.slice()) {
+        if (s.dbId && !ids.has(String(s.dbId))) {
+          wallState.byId.delete(s.s);
+          wallState.byDb.delete(String(s.dbId));
+          const i = wallState.strokes.indexOf(s);
+          if (i >= 0) wallState.strokes.splice(i, 1);
+          changed = true;
+        }
+      }
+      if (changed) scheduleWallRender();
+    } catch (e) {}
+  }
+
+  function startWallPolling() {
+    if (wallPollTimer) return;
+    wallPollTimer = setInterval(() => {
+      wallPollTicks++;
+      pollWallAdds();
+      if (wallPollTicks % 5 === 0) pollWallReconcile();
+    }, 6000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) pollWallAdds(); });
   }
 
   function initWall() {
@@ -1332,6 +1402,7 @@
     wallState.ready = true;
     scheduleWallRender();
     loadWallStrokes();
+    startWallPolling();
     if (!sb || !state.joined) return;
     try {
       wallChannel = sb.channel('potok-wall', { config: { broadcast: { self: false } } });
@@ -1339,30 +1410,7 @@
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'potok_strokes' }, async (payload) => {
           const row = payload && payload.new;
           if (!row || row.room !== WALL_ROOM) return;
-          const dec = await decryptPayload(row.payload || '');
-          if (dec.failed || dec.plain) return;
-          let st = null;
-          try { st = JSON.parse(dec.t); } catch (e) { return; }
-          if (!st || !st.s) return;
-          const ex = wallState.byId.get(st.s);
-          if (ex) {
-            ex.dbId = row.id;
-            wallState.byDb.set(String(row.id), st.s);
-            if (ex.partial) {
-              Object.assign(ex, st, { partial: false, dbId: row.id });
-              if (row.created_at) ex.tm = Date.parse(row.created_at);
-              scheduleWallRender();
-            }
-            return;
-          }
-          st.tm = row.created_at ? Date.parse(row.created_at) : Date.now();
-          st.dbId = row.id;
-          st.uid = row.user_id || null;
-          wallState.strokes.push(st);
-          wallState.byId.set(st.s, st);
-          wallState.byDb.set(String(row.id), st.s);
-          wallState.live.delete(st.s);
-          scheduleWallRender();
+          if (await ingestWallRow(row)) scheduleWallRender();
         })
         .on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'potok_strokes' }, (payload) => {
           const oldRow = payload && payload.old;

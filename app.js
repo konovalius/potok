@@ -1349,16 +1349,25 @@
     } catch (e) { /* стена догрузится позже */ }
   }
 
+  function withTimeout(promise, ms) {
+    return Promise.race([
+      promise,
+      new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), ms))
+    ]);
+  }
+
   async function pollWallAdds() {
     if (!sb || !state.joined || !wallState.ready) return;
     try {
       const sinceIso = new Date(Math.max(wallLastTs - 1000, 0)).toISOString();
-      const { data, error } = await sb.from('potok_strokes')
+      const res = await withTimeout(sb.from('potok_strokes')
         .select('id, room, payload, user_id, created_at')
         .eq('room', WALL_ROOM)
         .gt('created_at', sinceIso)
         .order('created_at', { ascending: true })
-        .limit(100);
+        .limit(100), 45000);
+      if (!res || res.timeout) { wallState.pollErr = 'timeout'; return; }
+      const { data, error } = res;
       if (error) { wallState.pollErr = String(error.message || 'poll-error'); return; }
       let changed = false;
       for (const row of (data || [])) { if (await ingestWallRow(row)) changed = true; }
@@ -1388,11 +1397,15 @@
 
   function startWallPolling() {
     if (wallPollTimer) return;
-    wallPollTimer = setInterval(() => {
-      wallPollTicks++;
-      pollWallAdds();
-      if (wallPollTicks % 5 === 0) pollWallReconcile();
-    }, 6000);
+    let tick = 0;
+    const loop = async () => {
+      tick++;
+      wallPollTicks = tick;
+      await pollWallAdds();
+      if (tick % 5 === 0) await pollWallReconcile();
+      wallPollTimer = setTimeout(loop, 6000);
+    };
+    wallPollTimer = setTimeout(loop, 5000);
     document.addEventListener('visibilitychange', () => { if (!document.hidden) pollWallAdds(); });
   }
 

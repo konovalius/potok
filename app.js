@@ -153,7 +153,7 @@
       const ct = buf.slice(12);
       const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, cryptoKey, ct);
       const obj = JSON.parse(new TextDecoder().decode(pt));
-      return { t: String(obj.t || ''), n: String(obj.n || ''), plain: false, failed: false };
+      return { t: String(obj.t || ''), n: String(obj.n || ''), obj, plain: false, failed: false };
     } catch (e) {
       return { t: 'Сообщение зашифровано — нет ключа или повреждено', n: '', plain: false, failed: true };
     }
@@ -1274,13 +1274,13 @@
     }
     commitWallStroke(s);
   }
-
   function commitWallStroke(s) {
     s.tm = Date.now();
     s.uid = (currentUser && currentUser.id) || null;
     wallState.strokes.push(s);
     wallState.byId.set(s.s, s);
     scheduleWallRender();
+    setTimeout(scheduleWallRender, 450);
     persistWallStroke(s);
   }
 
@@ -1319,8 +1319,8 @@
     if (wallState.byDb.has(key)) return false;
     const dec = await decryptPayload(row.payload || '');
     if (dec.failed || dec.plain) return false;
-    let st = null;
-    try { st = JSON.parse(dec.t); } catch (e) { return false; }
+    let st = (dec.obj && typeof dec.obj === 'object') ? dec.obj : null;
+    if (!st) return false;
     if (!st || !st.s) return false;
     const ex = wallState.byId.get(st.s);
     if (ex) {
@@ -1444,8 +1444,8 @@
           if (!enc) return;
           const dec = await decryptPayload(enc);
           if (dec.failed || dec.plain) return;
-          let chunk = null;
-          try { chunk = JSON.parse(dec.t); } catch (e) { return; }
+          chunk = (dec.obj && typeof dec.obj === 'object') ? dec.obj : null;
+          if (!chunk) return;
           if (!chunk || !chunk.s || wallState.byId.has(chunk.s)) return;
           let live = wallState.live.get(chunk.s);
           if (!live) {
